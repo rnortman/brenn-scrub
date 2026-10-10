@@ -1,0 +1,62 @@
+# Reusable scrub gate for a consumer repository's CI:
+#
+#   jobs:
+#     scrub:
+#       uses: rnortman/brenn-scrub/.github/workflows/tree-scan.yml@vX.Y.Z
+#
+# The check then reports as `scrub / tree-scan`. It installs the brenn-scrub
+# release this tag published and the gitleaks release that version pins, then
+# runs `brenn-scrub init --check` and `brenn-scrub tree` on the caller's
+# checkout. No overlay exists in CI, so the scan uses the public rules only.
+#
+# TODO(forgejo-tree-scan): GitHub-hosted callers only.
+name: tree-scan
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  tree-scan:
+    name: tree-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      # Installed outside the checkout: the tree scan must see repo content
+      # only, not the scanner's own binary.
+      #
+      # The sha256 is the release's published checksum for this asset. Release
+      # assets are mutable, so the version check alone proves nothing; the hash
+      # is the real gate.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.0
+          GITLEAKS_SHA256: 79a3ab579b53f71efd634f3aaf7e04a0fa0cf206b7ed434638d1547a2470a66e
+        run: |
+          mkdir -p "$RUNNER_TEMP/gitleaks"
+          cd "$RUNNER_TEMP/gitleaks"
+          curl -fsSL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks version | grep -qx "${GITLEAKS_VERSION}"
+          echo "$RUNNER_TEMP/gitleaks" >> "$GITHUB_PATH"
+
+      # Run from outside the checkout so a caller's rust-toolchain.toml does not
+      # choose the toolchain the install builds with.
+      # TODO(prebuilt-release-binaries): builds from source on every run.
+      - name: Install brenn-scrub
+        working-directory: ${{ runner.temp }}
+        run: |
+          cargo install --locked brenn-scrub --version 0.1.0 --root "$RUNNER_TEMP/brenn-scrub"
+          echo "$RUNNER_TEMP/brenn-scrub/bin" >> "$GITHUB_PATH"
+
+      - name: Check the scrub kit
+        run: brenn-scrub init --check
+
+      - name: Scan tree
+        run: brenn-scrub tree

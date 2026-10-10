@@ -1,0 +1,6 @@
+/target
+.gitleaks.local.toml
+CLAUDE.local.md
+.claude/settings.local.json
+recipes/bazel/bazel-*
+recipes/bazel/MODULE.bazel.lock

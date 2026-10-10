@@ -1,0 +1,166 @@
+//! Staging scan input in a temp directory at repo-relative paths.
+//!
+//! gitleaks has no files-from input, so scoping a scan to a chosen set of
+//! files means mirroring them into a directory and scanning that. Paths are
+//! preserved rather than flattened: extensions drive path allowlists,
+//! same-basename files must not collide, and directory-shaped allowlists stay
+//! correct.
+
+use std::path::{Component, Path, PathBuf};
+
+pub struct Mirror {
+    dir: tempfile::TempDir,
+}
+
+impl Mirror {
+    pub fn new() -> Mirror {
+        Mirror {
+            dir: tempfile::Builder::new()
+                .prefix("brenn-scrub-mirror")
+                .tempdir()
+                .expect("cannot create mirror temp dir"),
+        }
+    }
+
+    pub fn root(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// Resolve a repo-relative path inside the mirror, refusing anything that
+    /// would escape it or land on an entry already mirrored.
+    ///
+    /// The mirror is fresh per run and every caller iterates a set of distinct
+    /// paths, so a name arriving twice means the caller's idea of "one entry"
+    /// broke. It is refused rather than overwritten: the second write of a
+    /// hardlinked entry would go through `fs::copy`, whose truncate-then-read
+    /// destroys the worktree file it is reading from.
+    fn target(&self, rel: &Path) -> PathBuf {
+        assert!(
+            rel.is_relative(),
+            "mirror path must be relative: {}",
+            rel.display()
+        );
+        assert!(
+            !rel.components().any(|c| matches!(c, Component::ParentDir)),
+            "mirror path must not contain '..': {}",
+            rel.display()
+        );
+        let target = self.dir.path().join(rel);
+        assert!(
+            !target.exists(),
+            "mirror path is already mirrored: {}",
+            rel.display()
+        );
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .unwrap_or_else(|e| panic!("cannot create {}: {e}", parent.display()));
+        }
+        target
+    }
+
+    pub fn write(&self, rel: &Path, content: &[u8]) {
+        let target = self.target(rel);
+        std::fs::write(&target, content)
+            .unwrap_or_else(|e| panic!("cannot write {}: {e}", target.display()));
+    }
+
+    /// Hardlink when the filesystem allows it, copy otherwise. Content is
+    /// identical either way; the link is purely to keep large trees cheap.
+    pub fn link_or_copy(&self, rel: &Path, src: &Path) {
+        let target = self.target(rel);
+        if std::fs::hard_link(src, &target).is_ok() {
+            return;
+        }
+        std::fs::copy(src, &target).unwrap_or_else(|e| {
+            panic!("cannot copy {} to {}: {e}", src.display(), target.display())
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_basename_files_do_not_collide() {
+        let m = Mirror::new();
+        m.write(Path::new("pkg/src/mod.rs"), b"alpha");
+        m.write(Path::new("surface/kernel/src/mod.rs"), b"beta");
+
+        assert_eq!(
+            std::fs::read(m.root().join("pkg/src/mod.rs")).unwrap(),
+            b"alpha"
+        );
+        assert_eq!(
+            std::fs::read(m.root().join("surface/kernel/src/mod.rs")).unwrap(),
+            b"beta"
+        );
+    }
+
+    #[test]
+    fn extension_is_preserved_so_path_allowlists_apply() {
+        let m = Mirror::new();
+        m.write(Path::new("docs/notes.md"), b"x");
+        m.write(Path::new("src/a.rs"), b"x");
+        assert!(m.root().join("docs/notes.md").exists());
+        assert!(m.root().join("src/a.rs").exists());
+    }
+
+    #[test]
+    #[should_panic(expected = "must be relative")]
+    fn absolute_mirror_path_panics() {
+        Mirror::new().write(Path::new("/etc/passwd"), b"x");
+    }
+
+    #[test]
+    #[should_panic(expected = "must not contain '..'")]
+    fn parent_dir_escape_panics() {
+        Mirror::new().write(Path::new("a/../../outside.rs"), b"x");
+    }
+
+    #[test]
+    #[should_panic(expected = "already mirrored")]
+    fn mirroring_one_path_twice_panics_rather_than_overwriting() {
+        let m = Mirror::new();
+        m.write(Path::new("src/a.rs"), b"first");
+        m.write(Path::new("src/a.rs"), b"second");
+    }
+
+    /// The sharpest consequence of a duplicate: the first `link_or_copy`
+    /// hardlinks the mirror entry to the worktree file, so a second one falls
+    /// through to `fs::copy(src, target)` with `src` and `target` the same
+    /// inode -- which truncates the *source* to zero and then mirrors the empty
+    /// result. That is data destruction plus a scan of nothing, both silent.
+    #[test]
+    fn a_repeated_link_or_copy_cannot_truncate_the_source() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("orig.rs");
+        std::fs::write(&src, b"let token = \"keepme\";\n").unwrap();
+
+        let m = Mirror::new();
+        m.link_or_copy(Path::new("orig.rs"), &src);
+        let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            m.link_or_copy(Path::new("orig.rs"), &src)
+        }));
+        assert!(again.is_err(), "a second mirror of one path must refuse");
+        assert_eq!(
+            std::fs::read(&src).unwrap(),
+            b"let token = \"keepme\";\n",
+            "the source file must survive a refused duplicate"
+        );
+    }
+
+    #[test]
+    fn link_or_copy_reproduces_content() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("orig.rs");
+        std::fs::write(&src, b"contents").unwrap();
+
+        let m = Mirror::new();
+        m.link_or_copy(Path::new("nested/orig.rs"), &src);
+        assert_eq!(
+            std::fs::read(m.root().join("nested/orig.rs")).unwrap(),
+            b"contents"
+        );
+    }
+}

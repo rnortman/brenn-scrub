@@ -1,0 +1,71 @@
+"""brenn-scrub and the gitleaks release it wraps, built and fetched by Bazel.
+
+A consumer transcribes this file into its own MODULE.bazel and the rest of
+this directory into a `tools/scrub/` package; README.md says what changes on
+the way. A release moves the `crate.spec` version, and the gitleaks version
+with both sha256s when the crate's gitleaks pin moves, together.
+"""
+
+module(name = "brenn_scrub_recipe")
+
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "rules_rust", version = "0.73.0")
+bazel_dep(name = "rules_shell", version = "0.6.1")
+
+# The toolchain the crate is built with; brenn-scrub's rust-version is 1.95.
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2024",
+    versions = ["1.95.0"],
+)
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")
+
+# brenn-scrub, from crates.io, in a hub of its own: a build tool nothing links
+# must not join a workspace hub's feature unification. `repositories` is
+# required, not optional: a crate.spec without it applies to every hub in the
+# module.
+#
+# No lockfile here. The hub is pinned in the consumer's own tree, the same way
+# its main hub is pinned; README.md has both forms.
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.spec(
+    package = "brenn-scrub",
+    repositories = ["scrub_crates"],
+    version = "=0.1.0",
+)
+crate.annotation(
+    crate = "brenn-scrub",
+    gen_binaries = ["brenn-scrub"],
+    repositories = ["scrub_crates"],
+)
+crate.from_specs(name = "scrub_crates")
+use_repo(crate, "scrub_crates")
+
+# gitleaks: the release brenn-scrub pins. brenn-scrub refuses to run with any
+# other gitleaks version, so this version must equal the crate's pinned
+# gitleaks release (its CHANGELOG names it).
+GITLEAKS_VERSION = "8.30.0"
+
+GITLEAKS_SHA256_X86_64 = "79a3ab579b53f71efd634f3aaf7e04a0fa0cf206b7ed434638d1547a2470a66e"
+
+GITLEAKS_SHA256_AARCH64 = "b4cbbb6ddf7d1b2a603088cd03a4e3f7ce48ee7fd449b51f7de6ee2906f5fa2f"
+
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "gitleaks_x86_64_linux",
+    build_file = "//:gitleaks.BUILD.bazel",
+    sha256 = GITLEAKS_SHA256_X86_64,
+    url = "https://github.com/gitleaks/gitleaks/releases/download/v" + GITLEAKS_VERSION +
+          "/gitleaks_" + GITLEAKS_VERSION + "_linux_x64.tar.gz",
+)
+
+http_archive(
+    name = "gitleaks_aarch64_linux",
+    build_file = "//:gitleaks.BUILD.bazel",
+    sha256 = GITLEAKS_SHA256_AARCH64,
+    url = "https://github.com/gitleaks/gitleaks/releases/download/v" + GITLEAKS_VERSION +
+          "/gitleaks_" + GITLEAKS_VERSION + "_linux_arm64.tar.gz",
+)

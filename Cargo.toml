@@ -1,0 +1,25 @@
+[package]
+name = "brenn-scrub"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "gitleaks wrapper: write-time, staged, pushed-range, and full-tree scrub scans"
+license = "Apache-2.0"
+repository = "https://github.com/rnortman/brenn-scrub"
+readme = "README.md"
+keywords = ["gitleaks", "secrets", "git-hooks", "scanning"]
+categories = ["development-tools", "command-line-utilities"]
+include = ["/src", "/template", "/README.md", "/CHANGELOG.md", "/LICENSE", "/NOTICE"]
+
+[[bin]]
+name = "brenn-scrub"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tempfile = "3"
+toml = "1"
+
+[dev-dependencies]
+brenn-git-fixture = "0.1"

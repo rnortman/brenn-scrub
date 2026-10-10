@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: check (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      # rust-toolchain.toml pins the toolchain and its rustfmt/clippy; rustup
+      # installs it on first use.
+      - name: Install Rust
+        run: rustup toolchain install
+
+      # Installed outside the checkout and handed to the suites by path. CI is
+      # set on every Actions job, so the suites fail rather than skip if this
+      # binary is missing or off-pin.
+      #
+      # The sha256 is the release's published checksum for this asset. Release
+      # assets are mutable, so the version check alone proves nothing; the hash
+      # is the real gate.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.0
+          GITLEAKS_SHA256: 79a3ab579b53f71efd634f3aaf7e04a0fa0cf206b7ed434638d1547a2470a66e
+        run: |
+          mkdir -p "$RUNNER_TEMP/gitleaks"
+          cd "$RUNNER_TEMP/gitleaks"
+          curl -fsSL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks version | grep -qx "${GITLEAKS_VERSION}"
+          echo "BRENN_SCRUB_TEST_GITLEAKS=$RUNNER_TEMP/gitleaks/gitleaks" >> "$GITHUB_ENV"
+
+      - run: make check
+
+  # The two commands tree-scan.yml runs, with the binary this commit builds
+  # instead of the published one.
+  self-check:
+    name: self-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.0
+          GITLEAKS_SHA256: 79a3ab579b53f71efd634f3aaf7e04a0fa0cf206b7ed434638d1547a2470a66e
+        run: |
+          mkdir -p "$RUNNER_TEMP/gitleaks"
+          cd "$RUNNER_TEMP/gitleaks"
+          curl -fsSL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks version | grep -qx "${GITLEAKS_VERSION}"
+          echo "$RUNNER_TEMP/gitleaks" >> "$GITHUB_PATH"
+
+      - run: cargo build --locked
+
+      - name: Check the scrub kit
+        run: target/debug/brenn-scrub init --check
+
+      - name: Scan tree
+        run: target/debug/brenn-scrub tree
+
+  # Dispatched by hand on a release tag after `cargo publish`: the cargo
+  # consumer path, installing the published crate.
+  release-smoke:
+    name: release-smoke
+    if: github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/tree-scan.yml
+
+  # The Bazel consumer path, also after `cargo publish`: recipes/bazel/ fetches
+  # the published crate and the pinned gitleaks and runs the wrapper. Nothing
+  # else is installed, so the scan's gitleaks can only be the recipe's. The
+  # recipe module sits inside this checkout, so both commands check this
+  # repository's own kit and tree.
+  release-smoke-bazel:
+    name: release-smoke (bazel recipe)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: recipes/bazel
+    steps:
+      - uses: actions/checkout@v7
+
+      # The runner image ships no Bazel, and .bazelversion is honoured only by
+      # a launcher that reads it. Pinned by version and checksum: a release
+      # asset is mutable, and this binary decides what the job builds.
+      - name: Install bazelisk
+        env:
+          BAZELISK_VERSION: 1.29.0
+          BAZELISK_SHA256: 5a408715e932c0250d28bd84555f12edbf70117de42f9181691c736eacc4a992
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/bazel" \
+            "https://github.com/bazelbuild/bazelisk/releases/download/v${BAZELISK_VERSION}/bazelisk-linux-amd64"
+          echo "${BAZELISK_SHA256}  $RUNNER_TEMP/bazel" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/bazel"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Check the scrub kit through the recipe
+        run: bazel run //:brenn-scrub -- init --check
+
+      - name: Scan tree through the recipe
+        run: bazel run //:brenn-scrub -- tree

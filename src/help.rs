@@ -15,11 +15,13 @@ usage: brenn-scrub <mode> [options]
                              .githooks/pre-push
   tree [<path>] [--exclude <prefix>]...
                              scan tracked files; run by hand
+  history                    scan every commit reachable from any ref; run
+                             by hand
   init [--check] [<repo>]    lay the hook shims and rule file into a repo, or
                              verify them; run by hand and by `make check`
 
 stdin: `hook` and `range` read a protocol on stdin (see their --help).
-`staged`, `tree` and `init` read nothing -- run them bare inside a repo.
+`staged`, `tree`, `history` and `init` read nothing -- run them bare inside a repo.
 
 `brenn-scrub <mode> --help` documents one mode in full.";
 
@@ -103,6 +105,24 @@ exits: 0 when findings is empty; 1 otherwise, or when gitleaks is missing or
        off-pin.
 called by: a human.";
 
+pub const HISTORY: &str = "\
+usage: brenn-scrub history
+
+Scans the whole commit history: every commit reachable from any branch, tag
+or other ref. The audit to run before a repository with private history is
+published.
+
+stdin: nothing -- do not pipe input. Piped input is ignored entirely.
+scans: every reachable commit's diff with every rule, diff-only rules
+       included, and for each merge what it changes beyond git's automatic
+       merge (a conflict resolution, say). Each finding names its commit.
+       Commit messages are not scanned: read them before publishing. The tree
+       at the tip is `tree`'s scope, not this one.
+needs: git 2.36 or later.
+exits: 0 clean; 1 on findings, when gitleaks is missing or off-pin, or when
+       git is older than 2.36.
+called by: a human.";
+
 pub const INIT: &str = "\
 usage: brenn-scrub init [--check] [<repo>]
 
@@ -143,6 +163,7 @@ pub fn for_mode(verb: Option<&str>) -> &'static str {
         Some("staged") => STAGED,
         Some("range") => RANGE,
         Some("tree") => TREE,
+        Some("history") => HISTORY,
         Some("init") => INIT,
         _ => UMBRELLA,
     }
@@ -158,6 +179,7 @@ mod tests {
         assert!(RANGE.contains("<local ref> <local sha> <remote ref> <remote sha>"));
         assert!(STAGED.contains("stdin: nothing -- do not pipe input"));
         assert!(TREE.contains("stdin: nothing -- do not pipe input"));
+        assert!(HISTORY.contains("stdin: nothing -- do not pipe input"));
         assert!(INIT.contains("stdin: nothing -- do not pipe input"));
     }
 
@@ -172,7 +194,7 @@ mod tests {
 
     #[test]
     fn every_mode_help_names_its_caller_and_exit_codes() {
-        for text in [HOOK, STAGED, RANGE, TREE, INIT] {
+        for text in [HOOK, STAGED, RANGE, TREE, HISTORY, INIT] {
             assert!(text.contains("called by:"), "missing caller: {text}");
             assert!(text.contains("exits:"), "missing exit codes: {text}");
         }
@@ -180,7 +202,7 @@ mod tests {
 
     #[test]
     fn umbrella_lists_every_mode() {
-        for verb in ["hook", "staged", "range", "tree", "init"] {
+        for verb in ["hook", "staged", "range", "tree", "history", "init"] {
             assert!(UMBRELLA.contains(verb));
             assert_eq!(for_mode(Some(verb)), super::for_mode(Some(verb)));
             assert_ne!(for_mode(Some(verb)), UMBRELLA);
@@ -198,6 +220,7 @@ mod tests {
             ("staged", STAGED),
             ("range", RANGE),
             ("tree", TREE),
+            ("history", HISTORY),
             ("init", INIT),
         ] {
             crate::message::neutral::assert_neutral(text, name);

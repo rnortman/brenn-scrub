@@ -1,7 +1,7 @@
 //! End-to-end behavior of the modes whose *contract* is consumed by something
 //! other than a human reading stderr: `range`'s warn-only rollout switch,
-//! `tree`'s captured stdout, and `staged`'s reliance on the git environment a
-//! hook hands it.
+//! `tree`'s captured stdout, `staged`'s reliance on the git environment a
+//! hook hands it, and `history`'s reach past the tip tree.
 //!
 //! The first two were covered only at the argument-parsing layer, where an
 //! inverted or dropped branch downstream leaves every test green. These drive
@@ -150,6 +150,155 @@ fn a_clean_repo_passes_range_either_way() {
         let out = run_in(dir.path(), args, &stdin);
         assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
     }
+}
+
+/// The audit a repository with private history is published on: a string
+/// committed and later removed is gone from the tree, and `tree` rightly
+/// passes, so only a scan of every commit can find it.
+#[test]
+fn history_finds_what_a_later_commit_removed_and_tree_does_not() {
+    if !gitleaks_available() {
+        return;
+    }
+    let dir = repo_with(&[("src/a.rs", &canary())]);
+    let p = dir.path();
+    let leaked = git(p, &["rev-parse", "HEAD"]).trim().to_string();
+    write_file(p, "src/a.rs", "let user = \"alice\";\n");
+    git(p, &["commit", "-qam", "remove it"]);
+
+    let tree = run_in(p, &["tree"], "");
+    assert_eq!(tree.code, Some(0), "stderr: {}", tree.stderr);
+
+    let history = run_in(p, &["history"], "");
+    assert_eq!(history.code, Some(1), "stderr: {}", history.stderr);
+    assert!(
+        history
+            .stderr
+            .contains("found matches in the commit history"),
+        "{}",
+        history.stderr
+    );
+    assert!(
+        history.stderr.contains(&format!("commit {leaked}")),
+        "the finding must name the commit that added the string: {}",
+        history.stderr
+    );
+    assert!(
+        history.stderr.contains("rewrite the history")
+            && !history.stderr.contains("Rewrite the string"),
+        "a committed string is not fixed by editing the tree: {}",
+        history.stderr
+    );
+}
+
+/// A commit only another ref reaches is history too: the scan covers every
+/// ref, not just the checked-out branch.
+#[test]
+fn history_scans_commits_only_another_branch_reaches() {
+    if !gitleaks_available() {
+        return;
+    }
+    let dir = repo_with(&[("src/a.rs", "let user = \"alice\";\n")]);
+    let p = dir.path();
+    git(p, &["checkout", "-qb", "side"]);
+    write_file(p, "src/b.rs", &canary());
+    git(p, &["add", "-A"]);
+    git(p, &["commit", "-qm", "side"]);
+    let side = git(p, &["rev-parse", "side"]).trim().to_string();
+    git(p, &["checkout", "-q", "main"]);
+
+    let history = run_in(p, &["history"], "");
+    assert_eq!(history.code, Some(1), "stderr: {}", history.stderr);
+    assert!(
+        history
+            .stderr
+            .contains("found matches in the commit history")
+            && history.stderr.contains(&format!("commit {side}")),
+        "the finding must come from the side branch's commit: {}",
+        history.stderr
+    );
+}
+
+/// A merge's own change -- here a conflict resolution, the only commit that
+/// ever carries the string -- is history too, though `git log -p` shows a
+/// merge no diff.
+#[test]
+fn history_scans_what_only_a_merge_resolution_introduces() {
+    if !gitleaks_available() {
+        return;
+    }
+    let dir = repo_with(&[("src/a.rs", "let user = \"alice\";\n")]);
+    let p = dir.path();
+    git(p, &["checkout", "-qb", "side"]);
+    write_file(p, "src/b.rs", "let side = 1;\n");
+    git(p, &["add", "-A"]);
+    git(p, &["commit", "-qm", "side"]);
+    git(p, &["checkout", "-q", "main"]);
+    write_file(p, "src/b.rs", "let main = 1;\n");
+    git(p, &["add", "-A"]);
+    git(p, &["commit", "-qm", "main"]);
+    assert!(
+        !try_git(p, &["merge", "-q", "side"]),
+        "the fixture needs a conflict"
+    );
+    write_file(p, "src/b.rs", &canary());
+    git(p, &["add", "-A"]);
+    git(p, &["commit", "-qm", "merge"]);
+    let merge = git(p, &["rev-parse", "HEAD"]).trim().to_string();
+    write_file(p, "src/b.rs", "let both = 1;\n");
+    git(p, &["commit", "-qam", "remove it"]);
+
+    let history = run_in(p, &["history"], "");
+    assert_eq!(history.code, Some(1), "stderr: {}", history.stderr);
+    assert!(
+        history.stderr.contains(&format!("commit {merge}")),
+        "the finding must name the merge: {}",
+        history.stderr
+    );
+}
+
+/// The diff-only rules are part of the audit: `tree` filters them out, and
+/// `history` must not. Its remedy is accepting or rewriting, so the
+/// fix-forward note the gate appends for this rule is left out.
+#[test]
+fn history_reports_diff_only_rules() {
+    if !gitleaks_available() {
+        return;
+    }
+    let section = format!("// see design {}3\n", '\u{a7}');
+    let dir = repo_with(&[("src/a.rs", &section)]);
+    let p = dir.path();
+
+    let history = run_in(p, &["history"], "");
+    assert_eq!(history.code, Some(1), "stderr: {}", history.stderr);
+    assert!(
+        history.stderr.contains("[ephemeral-reference]"),
+        "{}",
+        history.stderr
+    );
+    assert!(
+        !history.stderr.contains("Cite stable published specs"),
+        "{}",
+        history.stderr
+    );
+}
+
+/// `history` reads nothing: piped text is neither a protocol nor a refusal,
+/// and a clean history says so.
+#[test]
+fn history_ignores_stdin_and_reports_a_clean_history() {
+    if !gitleaks_available() {
+        return;
+    }
+    let dir = repo_with(&[("src/a.rs", "let user = \"alice\";\n")]);
+    let stdin = format!("{}{}", new_ref_line(dir.path()), canary());
+    let out = run_in(dir.path(), &["history"], &stdin);
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    assert!(
+        out.stderr.contains("brenn-scrub history: clean"),
+        "{}",
+        out.stderr
+    );
 }
 
 fn tree_json(out: &Output) -> serde_json::Value {

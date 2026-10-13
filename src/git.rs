@@ -41,6 +41,14 @@ pub fn config_get(repo: &Path, key: &str) -> Option<String> {
     try_run(repo, &["config", "--get", key])
 }
 
+/// Whether `git log` in `repo` accepts the whitespace-separated `opts`.
+/// Lists nothing, so it holds in a repository without commits.
+pub fn accepts_log_opts(repo: &Path, opts: &str) -> bool {
+    let mut args = vec!["log", "-n0"];
+    args.extend(opts.split_whitespace());
+    try_run(repo, &args).is_some()
+}
+
 pub fn repo_root(from: &Path) -> PathBuf {
     let out = Command::new("git")
         .current_dir(from)
@@ -321,9 +329,9 @@ fn merge_base_opts(repo: &Path, local: &str) -> String {
 /// The remote SHA is only usable as a bound if it is in the local object
 /// store. The pre-push contract permits it not to be -- the remote can have
 /// advanced from another clone since the last fetch -- and a range against a
-/// missing object makes `git log` fail, which would abort the push even under
-/// `--warn-only`. Falling back to the merge-base bound over-scans, which is
-/// safe; failing the push over a stale local view is not.
+/// missing object makes `git log` fail, which gitleaks reports as a clean scan.
+/// Falling back to the merge-base bound over-scans, which is safe.
+// TODO(security-git-scan-passes-when-git-log-fails)
 pub fn log_opts_for(repo: &Path, update: &RefUpdate) -> Option<String> {
     match update {
         RefUpdate::Delete => None,
@@ -826,5 +834,19 @@ diff --git a/src/a.rs b/src/a.rs
         assert!(deleted_files(p).is_empty());
         std::fs::remove_file(p.join("f.rs")).unwrap();
         assert_eq!(deleted_files(p), vec![PathBuf::from("f.rs")]);
+    }
+
+    #[test]
+    fn accepts_log_opts_tells_a_known_option_from_a_rejected_one() {
+        let dir = repo_with_commit();
+        assert!(accepts_log_opts(dir.path(), "--all --diff-merges=remerge"));
+        assert!(!accepts_log_opts(dir.path(), "--all --diff-merges=bogus"));
+
+        let empty = tempfile::tempdir().unwrap();
+        init_repo(empty.path());
+        assert!(accepts_log_opts(
+            empty.path(),
+            "--all --diff-merges=remerge"
+        ));
     }
 }

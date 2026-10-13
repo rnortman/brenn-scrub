@@ -1,6 +1,6 @@
 //! brenn-scrub -- the one scrub entry point for every layer.
 //!
-//! Modes: `hook`, `staged`, `range`, `tree`, plus `init`, which lays the
+//! Modes: `hook`, `staged`, `range`, `tree`, `history`, plus `init`, which lays the
 //! consumer kit and verifies it -- see the `help` module for each mode's input
 //! contract, scope, and exit codes.
 //!
@@ -340,6 +340,40 @@ fn mode_range(warn_only: bool) -> ExitCode {
     ExitCode::from(EXIT_FAIL)
 }
 
+/// `git log` options of the history scan: every ref, and for each merge the
+/// diff between git's automatic merge and the commit -- a conflict resolution
+/// or a change only the merge makes, which plain `git log -p` never shows.
+/// Needs git 2.36.
+const HISTORY_LOG_OPTS: &str = "--all --diff-merges=remerge";
+
+/// Every commit reachable from any ref, with the full rule set: each
+/// non-merge commit's diff and what each merge changes beyond the automatic
+/// merge. Commit messages are not scanned. The tip tree is `tree`'s business,
+/// so none is extracted here.
+// TODO(security-history-scan-skips-commit-messages-and-merges)
+fn mode_history() -> ExitCode {
+    let (repo, resolved) = match gate_preamble("history") {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    // gitleaks reports a `git log` it could not run as a clean scan of zero
+    // commits, so an option this git rejects is caught here first.
+    if !git::accepts_log_opts(&repo, HISTORY_LOG_OPTS) {
+        eprintln!(
+            "brenn-scrub history: this git rejects `git log {HISTORY_LOG_OPTS}`; \
+             git 2.36 or later is required"
+        );
+        return ExitCode::from(EXIT_FAIL);
+    }
+    let findings = gitleaks::scan_git(&resolved.config_path, &repo, HISTORY_LOG_OPTS);
+    if findings.is_empty() {
+        eprintln!("brenn-scrub history: clean");
+        return ExitCode::from(EXIT_OK);
+    }
+    eprintln!("{}", message::history_rejection(&findings));
+    ExitCode::from(EXIT_FAIL)
+}
+
 /// Tree mode's stdout: the findings the exit code was decided on, together
 /// with the scope that produced them, so a captured worklist can never be read
 /// as a scan of more than it was.
@@ -514,6 +548,7 @@ enum Mode {
         scope: Option<String>,
         exclude: Vec<String>,
     },
+    History,
     Init {
         check: bool,
         repo: Option<String>,
@@ -577,9 +612,10 @@ fn dispatch(args: &[String]) -> Mode {
             [one] if one == "--warn-only" => Mode::Range { warn_only: true },
             _ => Mode::Usage(named()),
         },
+        Some("history") if rest.is_empty() => Mode::History,
         Some("tree") => parse_tree(rest),
         Some("init") => parse_init(rest),
-        Some("hook") | Some("staged") => Mode::Usage(named()),
+        Some("hook") | Some("staged") | Some("history") => Mode::Usage(named()),
         _ => Mode::Usage(None),
     }
 }
@@ -594,6 +630,7 @@ fn main() -> ExitCode {
             scope.as_deref(),
             &Exclusions::new(exclude.into_iter().map(PathBuf::from).collect()),
         ),
+        Mode::History => mode_history(),
         Mode::Init { check, repo } => mode_init(check, repo.as_deref()),
         Mode::Help(verb) => {
             println!("{}", help::for_mode(verb.as_deref()));
@@ -617,6 +654,7 @@ mod tests {
         assert_eq!(dispatch_of(&["hook"]), Mode::Hook);
         assert_eq!(dispatch_of(&["staged"]), Mode::Staged);
         assert_eq!(dispatch_of(&["range"]), Mode::Range { warn_only: false });
+        assert_eq!(dispatch_of(&["history"]), Mode::History);
         assert_eq!(
             dispatch_of(&["tree"]),
             Mode::Tree {
@@ -812,6 +850,14 @@ mod tests {
         assert_eq!(
             dispatch_of(&["staged", "extra"]),
             Mode::Usage(Some("staged".into()))
+        );
+        assert_eq!(
+            dispatch_of(&["history", "x"]),
+            Mode::Usage(Some("history".into()))
+        );
+        assert_eq!(
+            dispatch_of(&["history", "--all"]),
+            Mode::Usage(Some("history".into()))
         );
         assert_eq!(dispatch_of(&["nonsense"]), Mode::Usage(None));
     }

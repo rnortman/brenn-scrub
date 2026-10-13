@@ -151,6 +151,7 @@ fn base_args(config: &Path) -> Vec<String> {
     ]
 }
 
+// TODO(security-git-scan-passes-when-git-log-fails)
 fn run(args: &[String], cwd: Option<&Path>) -> Vec<Finding> {
     let mut cmd = Command::new("gitleaks");
     cmd.args(args);

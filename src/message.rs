@@ -24,6 +24,18 @@ fn ladder() -> String {
     .join("\n")
 }
 
+fn history_remedy() -> String {
+    [
+        "These strings are in past commits. Editing the tree, or adding a marker or an",
+        "allowlist now, does not remove them from those commits: an allowlist only",
+        "accepts them as published. For each finding, either:",
+        "  - accept it -- it is safe to publish as it stands; or",
+        "  - rewrite the history (amend, rebase or squash, or start a fresh root)",
+        "    before publishing, then run `brenn-scrub history` again.",
+    ]
+    .join("\n")
+}
+
 fn ephemeral_note() -> String {
     [
         "Section-symbol references to design and ADR docs rot: those docs are ephemeral",
@@ -68,6 +80,27 @@ pub mod neutral {
 
 /// Format findings for a blocked write or a failed gate.
 pub fn rejection(findings: &[Finding], heading: &str) -> String {
+    let mut out = listing(findings, heading);
+    out.push_str(&ladder());
+
+    if findings.iter().any(|f| f.rule_id == EPHEMERAL_RULE) {
+        out.push_str("\n\n");
+        out.push_str(&ephemeral_note());
+    }
+    out
+}
+
+/// Format findings of the whole-history audit. They are already committed, so
+/// the remedies are accepting them or rewriting history, not the fix-forward
+/// ladder.
+pub fn history_rejection(findings: &[Finding]) -> String {
+    let mut out = listing(findings, "brenn-scrub found matches in the commit history.");
+    out.push_str(&history_remedy());
+    out
+}
+
+/// The heading, then one entry per finding, then a blank line.
+fn listing(findings: &[Finding], heading: &str) -> String {
     let mut out = String::new();
     out.push_str(heading);
     out.push_str("\n\n");
@@ -83,12 +116,6 @@ pub fn rejection(findings: &[Finding], heading: &str) -> String {
     }
 
     out.push('\n');
-    out.push_str(&ladder());
-
-    if findings.iter().any(|f| f.rule_id == EPHEMERAL_RULE) {
-        out.push_str("\n\n");
-        out.push_str(&ephemeral_note());
-    }
     out
 }
 
@@ -170,12 +197,27 @@ mod tests {
         assert!(!msg.contains("(?i)"));
     }
 
+    #[test]
+    fn history_gives_history_remedies_not_the_ladder() {
+        let msg = history_rejection(&[finding("local-rule-a")]);
+        assert!(msg.starts_with("brenn-scrub found matches in the commit history."));
+        assert!(msg.contains("[local-rule-a]"));
+        assert!(msg.contains("rewrite the history"));
+        assert!(!msg.contains("Rewrite the string"));
+        assert!(!msg.contains("How to resolve"));
+    }
+
     use super::neutral::assert_neutral;
 
     #[test]
     fn every_message_variant_is_neutral() {
         assert_neutral(&ladder(), "ladder");
         assert_neutral(&ephemeral_note(), "ephemeral note");
+        assert_neutral(&history_remedy(), "history remedy");
+        assert_neutral(
+            &history_rejection(&[finding("local-rule-a")]),
+            "history rejection",
+        );
         assert_neutral(
             &rejection(&[finding("local-rule-a")], "Blocked."),
             "plain rejection",

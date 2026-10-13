@@ -2,7 +2,7 @@
 
 A secrets gate for git repositories, built on one pinned
 [gitleaks](https://github.com/gitleaks/gitleaks) release. The same rules run
-at four points:
+at four points, plus a whole-history audit:
 
 | Mode | When | Input |
 |---|---|---|
@@ -10,6 +10,7 @@ at four points:
 | `staged` | pre-commit | none; scans the staged diff |
 | `range` | pre-push | the git pre-push protocol on stdin |
 | `tree` | by hand and in CI | none; scans every tracked file |
+| `history` | by hand, before publishing a repository's history | none; scans every reachable commit |
 
 and one more verb, `init [--check]`, lays the hook shims and rule file into
 a repository and verifies them. `brenn-scrub <mode> --help` documents each
@@ -98,7 +99,7 @@ unscanned. One hook registration is therefore safe from any session.
 
 ## Running it by hand
 
-Two modes are meant for a human, and neither reads stdin:
+Three modes are meant for a human, and none reads stdin:
 
 - `brenn-scrub staged` scans what is staged right now, as the pre-commit
   hook does.
@@ -108,6 +109,16 @@ Two modes are meant for a human, and neither reads stdin:
   names each exclusion on stderr, and fails if a prefix matches no tracked
   file. Its stdout is a JSON object of the findings and the exclusions that
   produced them: capture it as a worklist.
+- `brenn-scrub history` scans every commit reachable from any ref, with
+  every rule, and names each finding's commit; a merge contributes what it
+  changes beyond git's automatic merge (git 2.36 or later). Commit messages
+  are not scanned: read them yourself. A string committed and
+  removed later passes `tree` but not `history`: run it before publishing
+  a repository whose history was private. (`range` cannot stand in for it:
+  a first push of `main` scans back only to the merge-base with the default
+  branch, which on a single-branch repository is the tip itself.) Its
+  findings are already committed, so editing the tree does not clear them:
+  accept them, or rewrite the history before publishing.
 
 `hook` and `range` consume protocols produced by Claude Code and by git, and
 refuse to run with a terminal on stdin.

@@ -4,6 +4,31 @@ Notable changes to brenn-scrub. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- New `brenn-scrub history` mode: an audit of a repository's entire commit
+  history, meant to be run by hand before a repository whose history was
+  private is published. The existing `tree` mode only checks files as they
+  are now, so a secret committed and later deleted passes it; `history`
+  checks every commit reachable from any branch or tag, with every rule, and
+  names the commit each finding came from. Merge commits are checked for
+  what they change beyond git's automatic merge (such as a hand-made
+  conflict resolution). Because its findings are already committed, its
+  advice is to accept each one or rewrite the history before publishing,
+  rather than to edit the files. Exits 0 when clean, 1 otherwise.
+  Requires git 2.36 or later.
+
+### Known limitations
+
+- `history` does not scan commit messages; read them yourself before
+  publishing.
+- If git fails part way through reading the history (for example, a damaged
+  repository), the scan can report fewer findings than exist, or report
+  clean. The same gap affects the pre-push check (`range`). Tracked in
+  `TODO.md`.
+
 ## [0.1.0] — 2026-10-10
 
 First public release, pinned to gitleaks 8.30.0. The tool was developed

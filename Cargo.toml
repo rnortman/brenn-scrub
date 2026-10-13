@@ -1,6 +1,6 @@
 [package]
 name = "brenn-scrub"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 description = "gitleaks wrapper: write-time, staged, pushed-range, and full-tree scrub scans"

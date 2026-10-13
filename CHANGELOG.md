@@ -6,6 +6,8 @@ Notable changes to brenn-scrub. Format follows
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-10-13
+
 ### Added
 
 - New `brenn-scrub history` mode: an audit of a repository's entire commit

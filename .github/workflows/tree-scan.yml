@@ -51,7 +51,7 @@ jobs:
       - name: Install brenn-scrub
         working-directory: ${{ runner.temp }}
         run: |
-          cargo install --locked brenn-scrub --version 0.1.0 --root "$RUNNER_TEMP/brenn-scrub"
+          cargo install --locked brenn-scrub --version 0.2.0 --root "$RUNNER_TEMP/brenn-scrub"
           echo "$RUNNER_TEMP/brenn-scrub/bin" >> "$GITHUB_PATH"
 
       - name: Check the scrub kit

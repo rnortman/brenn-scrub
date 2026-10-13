@@ -155,7 +155,7 @@ exact release tag:
 ```yaml
 jobs:
   scrub:
-    uses: rnortman/brenn-scrub/.github/workflows/tree-scan.yml@v0.1.0
+    uses: rnortman/brenn-scrub/.github/workflows/tree-scan.yml@v0.2.0
 ```
 
 It installs this release and the gitleaks release it pins (verified by sha256),

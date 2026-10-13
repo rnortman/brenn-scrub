@@ -48,7 +48,6 @@ jobs:
 
       # Run from outside the checkout so a caller's rust-toolchain.toml does not
       # choose the toolchain the install builds with.
-      # TODO(prebuilt-release-binaries): builds from source on every run.
       - name: Install brenn-scrub
         working-directory: ${{ runner.temp }}
         run: |

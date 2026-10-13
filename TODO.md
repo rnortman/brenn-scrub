@@ -12,12 +12,6 @@ body with the same steps (pinned gitleaks download with sha256 check,
 --check`, `brenn-scrub tree`) when a Forgejo-hosted repository adopts the
 scrub gate, and hold its pins to the same values as the GitHub workflow.
 
-## `prebuilt-release-binaries`
-
-`tree-scan.yml` builds brenn-scrub with `cargo install` on every consumer CI
-run. Attaching prebuilt, checksummed release binaries to each GitHub release
-and downloading one in the workflow would cut that build from the job.
-
 ## `security-history-scan-skips-commit-messages-and-merges`
 
 gitleaks' git mode scans patches only, so neither `history` nor `range`

@@ -20,14 +20,27 @@ Notable changes to brenn-scrub. Format follows
   rather than to edit the files. Exits 0 when clean, 1 otherwise.
   Requires git 2.36 or later.
 
+### Fixed
+
+- The pre-push check (`range`) could pass a push it had not fully scanned.
+  If the `git log` that gitleaks runs internally failed or wrote anything to
+  stderr — a damaged repository, a broken ref, or a setting such as
+  `GIT_TRACE` in the hook's environment — gitleaks still reported success
+  with only the commits git reached, often none. `range` and the new
+  `history` now refuse such a scan with exit 1 and a "scan did not complete"
+  message quoting git's output. `--warn-only` does not soften this: it lets
+  findings through, not an unscanned push. The pre-push hook runs whichever
+  `brenn-scrub` is on `PATH`, so updating the binary is enough to pick this
+  up.
+
 ### Known limitations
 
 - `history` does not scan commit messages; read them yourself before
   publishing.
-- If git fails part way through reading the history (for example, a damaged
-  repository), the scan can report fewer findings than exist, or report
-  clean. The same gap affects the pre-push check (`range`). Tracked in
-  `TODO.md`.
+- A `git log` killed without writing to stderr (by the OOM killer, a memory
+  cap, or an external timeout) still reads as a clean or partial scan in
+  `range` and `history`: gitleaks 8.30.0 reports git's exit status only at
+  debug level, which brenn-scrub does not enable.
 
 ## [0.1.0] — 2026-10-10
 

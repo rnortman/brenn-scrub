@@ -77,6 +77,21 @@ fn gate_preamble(mode: &str) -> Result<(PathBuf, config::Resolved), ExitCode> {
     Ok((repo, resolved))
 }
 
+/// A git-mode scan of `log_opts`, or its refusal already printed: an
+/// incomplete walk exits 1 under every flag. One copy, so the refusal's text
+/// and exit code cannot drift between the git-walking modes.
+fn scan_git_or_refuse(
+    verb: &str,
+    resolved: &config::Resolved,
+    repo: &Path,
+    log_opts: &str,
+) -> Result<Vec<Finding>, ExitCode> {
+    gitleaks::scan_git(&resolved.config_path, repo, log_opts).map_err(|incomplete| {
+        eprintln!("{}", incomplete_scan_message(verb, &incomplete.git_output));
+        ExitCode::from(EXIT_FAIL)
+    })
+}
+
 fn scan_mirror(resolved: &config::Resolved, mirror: &Mirror) -> Vec<Finding> {
     let raw = gitleaks::scan_dir(&resolved.config_path, mirror.root());
     gitleaks::relativize(raw, mirror.root())
@@ -110,6 +125,44 @@ fn misconfigured_hook_message(tool: &str) -> String {
         "brenn-scrub: hook misconfigured -- tool `{tool}` reached the scrub check but \
          this wrapper cannot read its added text. Either narrow the PreToolUse matcher \
          or teach brenn-scrub about `{tool}`. Refusing to pass it unscanned."
+    )
+}
+
+/// `text`'s lines, each indented two spaces, for quoting tool output inside a
+/// refusal.
+fn indented(text: &str) -> String {
+    text.lines()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The refusal for a git-mode scan gitleaks did not run to the end. Says
+/// "did not complete", not "nothing scanned": a partial report is real, and
+/// `range` may have processed earlier ref lines. gitleaks' stderr follows
+/// verbatim so the operator sees git's own words (`fatal: unable to read
+/// <sha>`, a trace line).
+fn incomplete_scan_message(verb: &str, git_output: &str) -> String {
+    format!(
+        "brenn-scrub {verb}: the scan did not complete. gitleaks exited 0 but the \
+         `git log` it ran wrote to stderr, so its report cannot establish that the \
+         {verb} is clean. git's output, as gitleaks relayed it:\n\n{}\n\n\
+         A damaged object store, a broken ref, or a setting that makes git write to \
+         stderr (GIT_TRACE, say) all do this. Fix the cause and rerun; no flag lifts \
+         this refusal.",
+        indented(git_output)
+    )
+}
+
+/// The refusal for a `history` whose `git log` options probe failed. Shows
+/// whatever git printed and offers the version floor as the likely cause
+/// rather than the diagnosis.
+fn history_probe_message(git_output: &str) -> String {
+    format!(
+        "brenn-scrub history: `git log -n0 {HISTORY_LOG_OPTS}` failed in this \
+         repository; git said:\n\n{}\n\n\
+         A git older than 2.36 (no --diff-merges=remerge) is the usual cause.",
+        indented(git_output)
     )
 }
 
@@ -302,7 +355,11 @@ fn mode_range(warn_only: bool) -> ExitCode {
             continue;
         };
         // Per-commit diffs: the full rule set, diff-only rules included.
-        findings.extend(gitleaks::scan_git(&resolved.config_path, &repo, &log_opts));
+        // An incomplete walk refuses here, before `warn_only` is consulted.
+        match scan_git_or_refuse("range", &resolved, &repo, &log_opts) {
+            Ok(found) => findings.extend(found),
+            Err(code) => return code,
+        }
 
         // Tip tree: what the remote ends up holding, tree rule set.
         let tip = match &update {
@@ -356,16 +413,17 @@ fn mode_history() -> ExitCode {
         Ok(v) => v,
         Err(code) => return code,
     };
-    // gitleaks reports a `git log` it could not run as a clean scan of zero
-    // commits, so an option this git rejects is caught here first.
-    if !git::accepts_log_opts(&repo, HISTORY_LOG_OPTS) {
-        eprintln!(
-            "brenn-scrub history: this git rejects `git log {HISTORY_LOG_OPTS}`; \
-             git 2.36 or later is required"
-        );
+    // The option string is checked first so a git that rejects it is named as
+    // such instead of surfacing as an incomplete scan with the scan's own
+    // output.
+    if let Err(git_output) = git::probe_log_opts(&repo, HISTORY_LOG_OPTS) {
+        eprintln!("{}", history_probe_message(&git_output));
         return ExitCode::from(EXIT_FAIL);
     }
-    let findings = gitleaks::scan_git(&resolved.config_path, &repo, HISTORY_LOG_OPTS);
+    let findings = match scan_git_or_refuse("history", &resolved, &repo, HISTORY_LOG_OPTS) {
+        Ok(found) => found,
+        Err(code) => return code,
+    };
     if findings.is_empty() {
         eprintln!("brenn-scrub history: clean");
         return ExitCode::from(EXIT_OK);
@@ -818,6 +876,44 @@ mod tests {
             ),
             "strip-prefix block message",
         );
+        for verb in ["range", "history"] {
+            assert_neutral(
+                &incomplete_scan_message(verb, "ERR [git] fatal: unable to read abc"),
+                "incomplete-scan refusal",
+            );
+        }
+        assert_neutral(
+            &history_probe_message("fatal: bad object refs/heads/broken"),
+            "history probe refusal",
+        );
+    }
+
+    #[test]
+    fn incomplete_scan_message_quotes_git_and_refuses_without_a_way_out() {
+        let git_output = "ERR [git] fatal: unable to read abc\nERR error=\"stderr is not empty\"\n";
+        for verb in ["range", "history"] {
+            let msg = incomplete_scan_message(verb, git_output);
+            assert!(msg.contains("did not complete"), "{msg}");
+            assert!(msg.contains(&format!("brenn-scrub {verb}:")), "{msg}");
+            assert!(msg.contains(&format!("the {verb} is clean")), "{msg}");
+            for line in git_output.lines() {
+                assert!(msg.contains(&format!("  {line}")), "{msg}");
+            }
+            assert!(msg.contains("no flag lifts"), "{msg}");
+            assert!(!msg.contains("nothing was scanned"), "{msg}");
+            assert!(!msg.contains("--warn-only"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn history_probe_message_shows_git_and_names_the_likely_cause() {
+        let msg = history_probe_message("fatal: bad object refs/heads/broken");
+        assert!(
+            msg.contains("  fatal: bad object refs/heads/broken"),
+            "{msg}"
+        );
+        assert!(msg.contains(HISTORY_LOG_OPTS), "{msg}");
+        assert!(msg.contains("2.36"), "{msg}");
     }
 
     /// The guard itself needs a pty to exercise and is deliberately left to

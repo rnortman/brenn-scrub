@@ -134,7 +134,8 @@ impl Version {
 
 /// Shared flags. `--exit-code 0` makes leaks a *reporting* outcome rather than
 /// a process failure, so any nonzero exit is an actual gitleaks malfunction
-/// and gets to panic.
+/// and gets to panic. In git mode exit 0 is not proof the `git log` gitleaks
+/// ran completed; `scan_git` settles that from stderr.
 fn base_args(config: &Path) -> Vec<String> {
     vec![
         "--config".into(),
@@ -151,8 +152,9 @@ fn base_args(config: &Path) -> Vec<String> {
     ]
 }
 
-// TODO(security-git-scan-passes-when-git-log-fails)
-fn run(args: &[String], cwd: Option<&Path>) -> Vec<Finding> {
+/// Run gitleaks and return its raw stdout and stderr, unparsed. A nonzero
+/// exit panics with the stderr text.
+fn run(args: &[String], cwd: Option<&Path>) -> (String, String) {
     let mut cmd = Command::new("gitleaks");
     cmd.args(args);
     if let Some(dir) = cwd {
@@ -166,7 +168,10 @@ fn run(args: &[String], cwd: Option<&Path>) -> Vec<Finding> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    parse_report(&String::from_utf8_lossy(&out.stdout))
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
 /// Scan a directory tree. Findings carry absolute paths under `dir`.
@@ -174,16 +179,49 @@ pub fn scan_dir(config: &Path, dir: &Path) -> Vec<Finding> {
     let mut args = vec!["dir".to_string()];
     args.extend(base_args(config));
     args.push(dir.to_string_lossy().into_owned());
-    run(&args, None)
+    let (stdout, _stderr) = run(&args, None);
+    parse_report(&stdout)
 }
 
-/// Scan commit history. `log_opts` is passed to `git log` by gitleaks.
-pub fn scan_git(config: &Path, repo: &Path, log_opts: &str) -> Vec<Finding> {
+/// A git-mode scan gitleaks finished without finishing the `git log` it
+/// ran: exit 0 with text on its stderr. `git_output` is that stderr,
+/// verbatim and colourless.
+#[derive(Debug, PartialEq, Eq)]
+pub struct IncompleteScan {
+    pub git_output: String,
+}
+
+/// Exit-0 interpretation of a git-mode run. Pinned gitleaks 8.30.0 exits 0
+/// whenever its `git log` wrote to stderr, whether git died or merely
+/// traced, and its report then covers only what git emitted first --
+/// usually nothing, sometimes a few findings. The report is not evidence
+/// either way; stderr is. Any byte refuses: a healthy run writes none (the
+/// real-engine tests in tests/modes.rs hold that). A `git log` killed
+/// without writing to stderr is not detected: gitleaks logs git's exit
+/// status only at debug level.
+fn complete_git_report(stdout: &str, stderr: &str) -> Result<Vec<Finding>, IncompleteScan> {
+    if !stderr.is_empty() {
+        return Err(IncompleteScan {
+            git_output: stderr.to_string(),
+        });
+    }
+    Ok(parse_report(stdout))
+}
+
+/// Scan commit history. `log_opts` is passed to `git log` by gitleaks. `Err`
+/// when gitleaks reports success but its `git log` did not run cleanly.
+pub fn scan_git(
+    config: &Path,
+    repo: &Path,
+    log_opts: &str,
+) -> Result<Vec<Finding>, IncompleteScan> {
     let mut args = vec!["git".to_string()];
     args.extend(base_args(config));
+    args.push("--no-color".into());
     args.push(format!("--log-opts={log_opts}"));
     args.push(repo.to_string_lossy().into_owned());
-    run(&args, Some(repo))
+    let (stdout, stderr) = run(&args, Some(repo));
+    complete_git_report(&stdout, &stderr)
 }
 
 #[cfg(test)]
@@ -257,6 +295,46 @@ mod tests {
         assert_eq!(findings[0].rule_id, "ephemeral-reference");
         assert_eq!(findings[0].start_line, 1);
         assert_eq!(findings[0].file, "/m/src/a.rs");
+    }
+
+    const ONE_FINDING: &str = concat!(
+        r#"[{"RuleID":"local-rule-a","Description":"d","StartLine":3,"#,
+        r#""Match":"m","File":"src/old.rs","Commit":"abc"}]"#,
+    );
+
+    #[test]
+    fn a_silent_git_run_yields_its_report() {
+        assert_eq!(complete_git_report("[]", ""), Ok(Vec::new()));
+        let found = complete_git_report(ONE_FINDING, "").expect("complete");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].rule_id, "local-rule-a");
+    }
+
+    #[test]
+    fn any_stderr_marks_the_git_scan_incomplete() {
+        assert_eq!(
+            complete_git_report("[]", "x"),
+            Err(IncompleteScan {
+                git_output: "x".into()
+            })
+        );
+        assert_eq!(
+            complete_git_report("[]", "\n"),
+            Err(IncompleteScan {
+                git_output: "\n".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_non_empty_report_does_not_rescue_an_incomplete_scan() {
+        let stderr = "ERR [git] fatal: unable to read abc\n";
+        assert_eq!(
+            complete_git_report(ONE_FINDING, stderr),
+            Err(IncompleteScan {
+                git_output: stderr.into()
+            })
+        );
     }
 
     #[test]

@@ -69,7 +69,6 @@ fn run_in_env(repo: &Path, args: &[&str], stdin: &str, env: &[(&str, &str)]) -> 
         // The overlay is a local convention; these assertions are about the
         // public rules only, so a machine's local overlay must not leak in.
         .env_remove("BRENN_SCRUB_DENYLIST")
-        .envs(env.iter().copied())
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -79,6 +78,9 @@ fn run_in_env(repo: &Path, args: &[&str], stdin: &str, env: &[(&str, &str)]) -> 
     // spawns — at some other repo entirely.
     brenn_git_fixture::hermetic(&mut cmd);
     common::prepend_path(&mut cmd, None);
+    // The case's own variables are a deliberate injection and must survive
+    // the `GIT_*` strip above, which would otherwise erase `GIT_TRACE`.
+    cmd.envs(env.iter().copied());
     let mut child = cmd.spawn().expect("failed to spawn brenn-scrub");
     child
         .stdin
@@ -94,10 +96,21 @@ fn run_in_env(repo: &Path, args: &[&str], stdin: &str, env: &[(&str, &str)]) -> 
     }
 }
 
+fn head(repo: &Path) -> String {
+    git(repo, &["rev-parse", "HEAD"]).trim().to_string()
+}
+
+/// Pre-push stdin for pushing `main` over a remote that holds `remote_sha`.
+fn update_line(repo: &Path, remote_sha: &str) -> String {
+    format!(
+        "refs/heads/main {} refs/heads/main {remote_sha}\n",
+        head(repo)
+    )
+}
+
 /// Pre-push stdin for pushing `main` as a ref the remote does not have.
 fn new_ref_line(repo: &Path) -> String {
-    let sha = git(repo, &["rev-parse", "HEAD"]).trim().to_string();
-    format!("refs/heads/main {sha} refs/heads/main {}\n", "0".repeat(40))
+    update_line(repo, &"0".repeat(40))
 }
 
 /// Pre-push ships warn-only and later flips to enforcing by deleting the flag.
@@ -162,7 +175,7 @@ fn history_finds_what_a_later_commit_removed_and_tree_does_not() {
     }
     let dir = repo_with(&[("src/a.rs", &canary())]);
     let p = dir.path();
-    let leaked = git(p, &["rev-parse", "HEAD"]).trim().to_string();
+    let leaked = head(p);
     write_file(p, "src/a.rs", "let user = \"alice\";\n");
     git(p, &["commit", "-qam", "remove it"]);
 
@@ -244,7 +257,7 @@ fn history_scans_what_only_a_merge_resolution_introduces() {
     write_file(p, "src/b.rs", &canary());
     git(p, &["add", "-A"]);
     git(p, &["commit", "-qm", "merge"]);
-    let merge = git(p, &["rev-parse", "HEAD"]).trim().to_string();
+    let merge = head(p);
     write_file(p, "src/b.rs", "let both = 1;\n");
     git(p, &["commit", "-qam", "remove it"]);
 
@@ -735,4 +748,232 @@ fn an_unresolved_merge_refuses_instead_of_scanning_or_truncating() {
         conflicted,
         "the scan must not touch the conflicted worktree file"
     );
+}
+
+/// A second token the built-in rules catch, distinct from `canary()`.
+fn second_canary() -> String {
+    format!(
+        "let gh2 = \"{}_{}\";\n",
+        "ghp", "Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i2"
+    )
+}
+
+/// Commit A (returned as `base`), then B adding `src/old.rs` with the canary,
+/// then C removing it. Also returns B's blob id for `src/old.rs`. The canary
+/// is absent from the tip, so only the commit walk can find it, and the tip
+/// tree does not need the blob, so `git archive` still works once it is gone.
+fn repo_with_removed_canary() -> (tempfile::TempDir, String, String) {
+    let dir = repo_with(&[("src/a.rs", "let user = \"alice\";\n")]);
+    let p = dir.path();
+    let base = head(p);
+    write_file(p, "src/old.rs", &canary());
+    git(p, &["add", "src/old.rs"]);
+    git(p, &["commit", "-qm", "add old"]);
+    let blob = git(p, &["rev-parse", "HEAD:src/old.rs"]).trim().to_string();
+    git(p, &["rm", "-q", "src/old.rs"]);
+    git(p, &["commit", "-qm", "remove old"]);
+    (dir, base, blob)
+}
+
+/// Delete `blob`'s loose object, so `git log -p` dies when it reaches it.
+fn damage_blob(repo: &Path, blob: &str) {
+    let counts = git(repo, &["count-objects", "-v"]);
+    assert!(
+        counts.lines().any(|l| l == "in-pack: 0"),
+        "fixture objects must be loose: {counts}"
+    );
+    let path = repo.join(".git/objects").join(&blob[..2]).join(&blob[2..]);
+    assert!(path.is_file(), "missing loose object {}", path.display());
+    std::fs::remove_file(path).expect("remove loose object");
+}
+
+fn assert_blocked_push(out: &Output) {
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert!(out.stderr.contains("blocked this push"), "{}", out.stderr);
+    assert!(out.stderr.contains("src/old.rs"), "{}", out.stderr);
+}
+
+fn assert_history_findings(out: &Output) {
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert!(
+        out.stderr.contains("found matches in the commit history"),
+        "{}",
+        out.stderr
+    );
+}
+
+fn assert_incomplete(out: &Output) {
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert!(out.stderr.contains("did not complete"), "{}", out.stderr);
+}
+
+const TRACE: &[(&str, &str)] = &[("GIT_TRACE", "1")];
+
+/// gitleaks exits 0 with an empty report when its `git log` writes a trace
+/// line to stderr; the push must be refused, not passed as clean.
+#[test]
+fn range_refuses_when_git_traces_instead_of_passing_an_empty_walk() {
+    if !gitleaks_available() {
+        return;
+    }
+    let (dir, base, _) = repo_with_removed_canary();
+    let p = dir.path();
+    let stdin = update_line(p, &base);
+    assert_blocked_push(&run_in(p, &["range"], &stdin));
+
+    let traced = run_in_env(p, &["range"], &stdin, TRACE);
+    assert_incomplete(&traced);
+    assert!(
+        traced.stderr.contains("trace: built-in: git log"),
+        "{}",
+        traced.stderr
+    );
+    assert!(
+        !traced.stderr.contains("blocked this push"),
+        "{}",
+        traced.stderr
+    );
+}
+
+#[test]
+fn history_refuses_when_git_traces() {
+    if !gitleaks_available() {
+        return;
+    }
+    let (dir, _, _) = repo_with_removed_canary();
+    let p = dir.path();
+    assert_history_findings(&run_in(p, &["history"], ""));
+
+    let traced = run_in_env(p, &["history"], "", TRACE);
+    assert_incomplete(&traced);
+    assert!(
+        traced.stderr.contains("trace: built-in: git log"),
+        "{}",
+        traced.stderr
+    );
+}
+
+/// A historical blob missing from the object store kills gitleaks' `git log`
+/// part way; gitleaks still exits 0, and the push must be refused.
+#[test]
+fn range_refuses_when_a_historical_blob_is_unreadable() {
+    if !gitleaks_available() {
+        return;
+    }
+    let (dir, base, blob) = repo_with_removed_canary();
+    let p = dir.path();
+    let stdin = update_line(p, &base);
+    assert_blocked_push(&run_in(p, &["range"], &stdin));
+
+    damage_blob(p, &blob);
+    let out = run_in(p, &["range"], &stdin);
+    assert_incomplete(&out);
+    assert!(
+        out.stderr.contains(&format!("unable to read {blob}")),
+        "{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn history_refuses_when_a_historical_blob_is_unreadable() {
+    if !gitleaks_available() {
+        return;
+    }
+    let (dir, _, blob) = repo_with_removed_canary();
+    let p = dir.path();
+    assert_history_findings(&run_in(p, &["history"], ""));
+
+    damage_blob(p, &blob);
+    let out = run_in(p, &["history"], "");
+    assert_incomplete(&out);
+    assert!(
+        out.stderr.contains(&format!("unable to read {blob}")),
+        "{}",
+        out.stderr
+    );
+}
+
+/// `--warn-only` lifts findings, never a walk that did not complete.
+#[test]
+fn warn_only_does_not_lift_an_incomplete_scan() {
+    if !gitleaks_available() {
+        return;
+    }
+    let (dir, base, blob) = repo_with_removed_canary();
+    let p = dir.path();
+    let stdin = update_line(p, &base);
+
+    let warned = run_in(p, &["range", "--warn-only"], &stdin);
+    assert_eq!(warned.code, Some(0), "stderr: {}", warned.stderr);
+    assert!(
+        warned.stderr.contains("would fail the scrub gate"),
+        "{}",
+        warned.stderr
+    );
+
+    damage_blob(p, &blob);
+    let out = run_in(p, &["range", "--warn-only"], &stdin);
+    assert_incomplete(&out);
+    assert!(
+        !out.stderr.contains("would fail the scrub gate"),
+        "{}",
+        out.stderr
+    );
+}
+
+/// Re-validates against the real engine that gitleaks still signals a dying
+/// `git log` through stderr while newer commits with findings are in flight.
+/// Whether the newer finding reaches the report is non-deterministic on the
+/// pinned engine, so only the refusal is asserted; that a non-empty report
+/// does not rescue an incomplete scan is pinned by the unit test
+/// `a_non_empty_report_does_not_rescue_an_incomplete_scan` in
+/// `src/gitleaks.rs`.
+#[test]
+fn an_incomplete_walk_refuses_with_findings_in_newer_commits() {
+    if !gitleaks_available() {
+        return;
+    }
+    let (dir, base, blob) = repo_with_removed_canary();
+    let p = dir.path();
+    write_file(p, "src/new.rs", &second_canary());
+    git(p, &["add", "src/new.rs"]);
+    git(p, &["commit", "-qm", "add new"]);
+    git(p, &["rm", "-q", "src/new.rs"]);
+    git(p, &["commit", "-qm", "remove new"]);
+    let stdin = update_line(p, &base);
+    assert_blocked_push(&run_in(p, &["range"], &stdin));
+    assert_history_findings(&run_in(p, &["history"], ""));
+
+    damage_blob(p, &blob);
+    assert_incomplete(&run_in(p, &["range"], &stdin));
+    assert_incomplete(&run_in(p, &["history"], ""));
+}
+
+/// A ref naming no object fails `history`'s `git log -n0` probe. The refusal
+/// quotes git rather than blaming the git version, and comes from the probe,
+/// not from the scan's incomplete-walk check.
+#[test]
+fn history_probe_refuses_a_broken_ref_and_quotes_git() {
+    if !gitleaks_available() {
+        return;
+    }
+    let (dir, _, _) = repo_with_removed_canary();
+    let p = dir.path();
+    assert_history_findings(&run_in(p, &["history"], ""));
+
+    write_file(
+        p,
+        ".git/refs/heads/broken",
+        &format!("{}\n", "1".repeat(40)),
+    );
+    let out = run_in(p, &["history"], "");
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert!(out.stderr.contains("git log -n0"), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("bad object refs/heads/broken"),
+        "{}",
+        out.stderr
+    );
+    assert!(!out.stderr.contains("did not complete"), "{}", out.stderr);
 }

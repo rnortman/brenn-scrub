@@ -75,8 +75,11 @@ stdin: the git pre-push contract, one line per ref (githooks(5)):
        with the default branch); an all-zero local sha means a deletion
        (nothing to scan).
 scans: per-commit diffs with every rule; tip trees with the tree rule set.
-exits: 0 clean; 1 on findings. With --warn-only, findings are reported and the
-       exit is 0 -- the pre-green rollout state.
+exits: 0 clean; 1 on findings, or when the scan did not complete (git
+       reported an error or wrote to stderr while gitleaks walked the range;
+       a git killed without a word goes unseen) -- that refusal
+       holds under --warn-only. With --warn-only, findings are reported and
+       the exit is 0 -- the pre-green rollout state.
 called by: .githooks/pre-push. Not a human-facing command -- there is no
        supported way to type its input by hand.";
 
@@ -120,7 +123,10 @@ scans: every reachable commit's diff with every rule, diff-only rules
        at the tip is `tree`'s scope, not this one.
 needs: git 2.36 or later.
 exits: 0 clean; 1 on findings, when gitleaks is missing or off-pin, or when
-       git is older than 2.36.
+       the scan did not complete (git could not list the history with the
+       options above, or reported an error or wrote to stderr during the
+       walk; the refusal shows what git said, and a git killed without a
+       word goes unseen).
 called by: a human.";
 
 pub const INIT: &str = "\
@@ -197,6 +203,13 @@ mod tests {
         for text in [HOOK, STAGED, RANGE, TREE, HISTORY, INIT] {
             assert!(text.contains("called by:"), "missing caller: {text}");
             assert!(text.contains("exits:"), "missing exit codes: {text}");
+        }
+    }
+
+    #[test]
+    fn git_walking_modes_name_the_incomplete_scan_exit() {
+        for text in [RANGE, HISTORY] {
+            assert!(text.contains("did not complete"), "{text}");
         }
     }
 

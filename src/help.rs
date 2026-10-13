@@ -61,6 +61,7 @@ pub const RANGE: &str = "\
 usage: brenn-scrub range [--warn-only]
 
 Scans everything a push would send: every commit's diff in the pushed range,
+what each merge changes beyond git's automatic merge, every commit's message,
 plus the tree at each tip.
 
 stdin: the git pre-push contract, one line per ref (githooks(5)):
@@ -74,12 +75,20 @@ stdin: the git pre-push contract, one line per ref (githooks(5)):
        An all-zero remote sha means a new ref (scanned back to the merge-base
        with the default branch); an all-zero local sha means a deletion
        (nothing to scan).
-scans: per-commit diffs with every rule; tip trees with the tree rule set.
-exits: 0 clean; 1 on findings, or when the scan did not complete (git
-       reported an error or wrote to stderr while gitleaks walked the range;
-       a git killed without a word goes unseen) -- that refusal
-       holds under --warn-only. With --warn-only, findings are reported and
-       the exit is 0 -- the pre-green rollout state.
+scans: per-commit diffs with every rule, including a merge's own resolution
+       (reported with git's `b/` path prefix); commit messages and tip trees
+       with the tree rule set. A finding in a message names its commit and
+       line. A merge with three or more parents contributes no diff of its
+       own.
+needs: git 2.36 or later.
+exits: 0 clean; 1 on findings, or when the scan did not complete (git could
+       not run the range's `git log` with the options above -- git 2.36 or
+       later is needed -- or could not list the commit messages, or reported
+       an error or wrote to stderr while gitleaks walked the range; the
+       refusal shows what git said, and a git killed without a word goes
+       unseen) -- every such refusal holds under --warn-only. With
+       --warn-only, findings are reported and the exit is 0 -- the pre-green
+       rollout state.
 called by: .githooks/pre-push. Not a human-facing command -- there is no
        supported way to type its input by hand.";
 
@@ -118,9 +127,11 @@ published.
 stdin: nothing -- do not pipe input. Piped input is ignored entirely.
 scans: every reachable commit's diff with every rule, diff-only rules
        included, and for each merge what it changes beyond git's automatic
-       merge (a conflict resolution, say). Each finding names its commit.
-       Commit messages are not scanned: read them before publishing. The tree
-       at the tip is `tree`'s scope, not this one.
+       merge (a conflict resolution, say), reported with git's `b/` path
+       prefix. Each finding names its commit. Commit messages are scanned
+       with the tree rule set, and a finding in one names its commit and
+       line. A merge with three or more parents contributes no diff of its
+       own. The tree at the tip is `tree`'s scope, not this one.
 needs: git 2.36 or later.
 exits: 0 clean; 1 on findings, when gitleaks is missing or off-pin, or when
        the scan did not complete (git could not list the history with the
@@ -211,6 +222,27 @@ mod tests {
         for text in [RANGE, HISTORY] {
             assert!(text.contains("did not complete"), "{text}");
         }
+    }
+
+    #[test]
+    fn git_walking_modes_say_messages_are_scanned_and_name_the_git_floor() {
+        for text in [RANGE, HISTORY] {
+            assert!(text.contains("2.36"), "{text}");
+            assert!(text.contains("message"), "{text}");
+            assert!(!text.contains("not scanned"), "{text}");
+            assert!(text.contains("three or more parents"), "{text}");
+            assert!(text.contains("`b/`"), "{text}");
+        }
+    }
+
+    #[test]
+    fn range_exits_name_both_new_refusals_and_that_they_outlast_warn_only() {
+        let segment = &RANGE[RANGE.find("exits:").unwrap()..RANGE.find("called by:").unwrap()];
+        // Joined into one line so the assertions do not depend on wrapping.
+        let exits = segment.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(exits.contains("could not run"), "{exits}");
+        assert!(exits.contains("list the commit messages"), "{exits}");
+        assert!(exits.contains("holds under --warn-only"), "{exits}");
     }
 
     #[test]

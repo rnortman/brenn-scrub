@@ -22,7 +22,7 @@ mod mirror;
 use exclude::Exclusions;
 use gitleaks::{Finding, Version};
 use mirror::Mirror;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -92,9 +92,39 @@ fn scan_git_or_refuse(
     })
 }
 
+// TODO(binary-sniff-skips-mirrored-files)
 fn scan_mirror(resolved: &config::Resolved, mirror: &Mirror) -> Vec<Finding> {
     let raw = gitleaks::scan_dir(&resolved.config_path, mirror.root());
     gitleaks::relativize(raw, mirror.root())
+}
+
+/// The commit messages `revs` selects, or the refusal already printed: a
+/// listing that failed or did not frame exits 1 under every flag.
+fn commit_messages_or_refuse(
+    verb: &str,
+    repo: &Path,
+    revs: &str,
+) -> Result<Vec<git::CommitMessage>, ExitCode> {
+    git::commit_messages(repo, revs).map_err(|detail| {
+        eprintln!("{}", message_walk_message(verb, &detail));
+        ExitCode::from(EXIT_FAIL)
+    })
+}
+
+/// Scan the messages of `commits` as one mirror of sha-named files with the
+/// tree rule set, attributing each finding to its commit. `commits` is
+/// already deduplicated by sha; `Mirror` refuses a repeated path.
+fn scan_messages(resolved: &config::Resolved, commits: &[git::CommitMessage]) -> Vec<Finding> {
+    if commits.is_empty() {
+        return Vec::new();
+    }
+    let mirror = Mirror::new();
+    for c in commits {
+        mirror.write(Path::new(&c.sha), &gitleaks::message_file(&c.body));
+    }
+    gitleaks::apply_tree_filter(gitleaks::attribute_to_messages(scan_mirror(
+        resolved, &mirror,
+    )))
 }
 
 fn report(findings: &[Finding], heading: &str) {
@@ -154,15 +184,27 @@ fn incomplete_scan_message(verb: &str, git_output: &str) -> String {
     )
 }
 
-/// The refusal for a `history` whose `git log` options probe failed. Shows
-/// whatever git printed and offers the version floor as the likely cause
-/// rather than the diagnosis.
-fn history_probe_message(git_output: &str) -> String {
+/// The refusal for a git-walking mode whose `git log` options probe failed.
+/// Shows whatever git printed and offers the version floor as the likely
+/// cause rather than the diagnosis.
+fn probe_message(verb: &str, log_opts: &str, git_output: &str) -> String {
     format!(
-        "brenn-scrub history: `git log -n0 {HISTORY_LOG_OPTS}` failed in this \
+        "brenn-scrub {verb}: `git log -n0 {log_opts}` failed in this \
          repository; git said:\n\n{}\n\n\
-         A git older than 2.36 (no --diff-merges=remerge) is the usual cause.",
+         A git older than 2.36 (no {MERGE_DIFF_OPTS}) is the usual cause.",
         indented(git_output)
+    )
+}
+
+/// The refusal for a commit-message listing that failed or did not frame;
+/// `detail` says which. Same contract as the diff-walk refusal: exit 1, no
+/// flag lifts it.
+fn message_walk_message(verb: &str, detail: &str) -> String {
+    format!(
+        "brenn-scrub {verb}: the scan did not complete. The {verb}'s commit messages \
+         could not be listed, so they cannot be established clean:\n\n{}\n\n\
+         Fix the cause and rerun; no flag lifts this refusal.",
+        indented(detail)
     )
 }
 
@@ -350,14 +392,39 @@ fn mode_range(warn_only: bool) -> ExitCode {
 
     let mut findings = Vec::new();
     let mut scanned_tips: Vec<String> = Vec::new();
+    let mut probed = false;
+    let mut messages: Vec<git::CommitMessage> = Vec::new();
+    let mut seen_commits: HashSet<String> = HashSet::new();
     for update in git::parse_push_refs(&raw) {
-        let Some(log_opts) = git::log_opts_for(&repo, &update) else {
+        let Some(revs) = git::log_opts_for(&repo, &update) else {
             continue;
         };
-        // Per-commit diffs: the full rule set, diff-only rules included.
-        // An incomplete walk refuses here, before `warn_only` is consulted.
+        let log_opts = with_merge_diffs(&revs);
+        // Probed once, with the first scannable update's own selection: a
+        // deletion-only push never needs merge diffs, and a bare probe
+        // without a revision fails on an unborn HEAD.
+        if !probed {
+            if let Err(git_output) = git::probe_log_opts(&repo, &log_opts) {
+                eprintln!("{}", probe_message("range", &log_opts, &git_output));
+                return ExitCode::from(EXIT_FAIL);
+            }
+            probed = true;
+        }
+        // Per-commit diffs, each merge's own resolution included: the full
+        // rule set, diff-only rules included. An incomplete walk refuses
+        // here, before `warn_only` is consulted.
         match scan_git_or_refuse("range", &resolved, &repo, &log_opts) {
             Ok(found) => findings.extend(found),
+            Err(code) => return code,
+        }
+        // Messages are collected per update and scanned once below; tips
+        // sharing history list the same commits.
+        match commit_messages_or_refuse("range", &repo, &revs) {
+            Ok(listed) => messages.extend(
+                listed
+                    .into_iter()
+                    .filter(|c| seen_commits.insert(c.sha.clone())),
+            ),
             Err(code) => return code,
         }
 
@@ -379,6 +446,7 @@ fn mode_range(warn_only: bool) -> ExitCode {
         git::extract_tree(&repo, tip, mirror.root());
         findings.extend(gitleaks::apply_tree_filter(scan_mirror(&resolved, &mirror)));
     }
+    findings.extend(scan_messages(&resolved, &messages));
 
     if findings.is_empty() {
         return ExitCode::from(EXIT_OK);
@@ -397,33 +465,46 @@ fn mode_range(warn_only: bool) -> ExitCode {
     ExitCode::from(EXIT_FAIL)
 }
 
-/// `git log` options of the history scan: every ref, and for each merge the
-/// diff between git's automatic merge and the commit -- a conflict resolution
-/// or a change only the merge makes, which plain `git log -p` never shows.
-/// Needs git 2.36.
-const HISTORY_LOG_OPTS: &str = "--all --diff-merges=remerge";
+/// Revision selection of the history scan: every ref.
+const HISTORY_REVISIONS: &str = "--all";
+
+/// For each merge, the diff between git's automatic merge and the commit --
+/// a conflict resolution or a change only the merge makes, which plain
+/// `git log -p` never shows. Needs git 2.36. Shared by `range` and `history`;
+/// never handed to the message walk, whose framing it breaks.
+const MERGE_DIFF_OPTS: &str = "--diff-merges=remerge";
+
+/// The diff walk's `git log` options for revision selection `revs`.
+fn with_merge_diffs(revs: &str) -> String {
+    format!("{revs} {MERGE_DIFF_OPTS}")
+}
 
 /// Every commit reachable from any ref, with the full rule set: each
 /// non-merge commit's diff and what each merge changes beyond the automatic
-/// merge. Commit messages are not scanned. The tip tree is `tree`'s business,
-/// so none is extracted here.
-// TODO(security-history-scan-skips-commit-messages-and-merges)
+/// merge; every commit's message with the tree rule set. The tip tree is
+/// `tree`'s business, so none is extracted here.
 fn mode_history() -> ExitCode {
     let (repo, resolved) = match gate_preamble("history") {
         Ok(v) => v,
         Err(code) => return code,
     };
+    let log_opts = with_merge_diffs(HISTORY_REVISIONS);
     // The option string is checked first so a git that rejects it is named as
     // such instead of surfacing as an incomplete scan with the scan's own
     // output.
-    if let Err(git_output) = git::probe_log_opts(&repo, HISTORY_LOG_OPTS) {
-        eprintln!("{}", history_probe_message(&git_output));
+    if let Err(git_output) = git::probe_log_opts(&repo, &log_opts) {
+        eprintln!("{}", probe_message("history", &log_opts, &git_output));
         return ExitCode::from(EXIT_FAIL);
     }
-    let findings = match scan_git_or_refuse("history", &resolved, &repo, HISTORY_LOG_OPTS) {
+    let mut findings = match scan_git_or_refuse("history", &resolved, &repo, &log_opts) {
         Ok(found) => found,
         Err(code) => return code,
     };
+    // `--all` lists each commit once, so no dedup is needed.
+    match commit_messages_or_refuse("history", &repo, HISTORY_REVISIONS) {
+        Ok(listed) => findings.extend(scan_messages(&resolved, &listed)),
+        Err(code) => return code,
+    }
     if findings.is_empty() {
         eprintln!("brenn-scrub history: clean");
         return ExitCode::from(EXIT_OK);
@@ -882,10 +963,20 @@ mod tests {
                 "incomplete-scan refusal",
             );
         }
-        assert_neutral(
-            &history_probe_message("fatal: bad object refs/heads/broken"),
-            "history probe refusal",
-        );
+        for verb in ["range", "history"] {
+            assert_neutral(
+                &probe_message(
+                    verb,
+                    "--all --diff-merges=remerge",
+                    "fatal: bad object refs/heads/broken",
+                ),
+                "probe refusal",
+            );
+            assert_neutral(
+                &message_walk_message(verb, "fatal: bad revision 'x..y'"),
+                "message-walk refusal",
+            );
+        }
     }
 
     #[test]
@@ -906,14 +997,49 @@ mod tests {
     }
 
     #[test]
-    fn history_probe_message_shows_git_and_names_the_likely_cause() {
-        let msg = history_probe_message("fatal: bad object refs/heads/broken");
-        assert!(
-            msg.contains("  fatal: bad object refs/heads/broken"),
-            "{msg}"
+    fn probe_message_shows_git_and_names_the_likely_cause() {
+        let range_opts = with_merge_diffs("abc..def");
+        for (verb, opts) in [
+            ("history", with_merge_diffs(HISTORY_REVISIONS)),
+            ("range", range_opts),
+        ] {
+            let msg = probe_message(verb, &opts, "fatal: bad object refs/heads/broken");
+            assert!(msg.contains(&format!("brenn-scrub {verb}:")), "{msg}");
+            assert!(msg.contains(&format!("`git log -n0 {opts}`")), "{msg}");
+            assert!(
+                msg.contains("  fatal: bad object refs/heads/broken"),
+                "{msg}"
+            );
+            assert!(msg.contains("2.36"), "{msg}");
+            assert!(!msg.contains("did not complete"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn message_walk_message_quotes_git_and_refuses_without_a_way_out() {
+        for verb in ["range", "history"] {
+            let msg =
+                message_walk_message(verb, "git log failed:\nfatal: bad revision 'x..y'\nsecond");
+            assert!(msg.contains("did not complete"), "{msg}");
+            assert!(msg.contains(&format!("brenn-scrub {verb}:")), "{msg}");
+            assert!(msg.contains(&format!("{verb}'s commit messages")), "{msg}");
+            assert!(msg.contains("  git log failed:"), "{msg}");
+            assert!(msg.contains("  fatal: bad revision 'x..y'"), "{msg}");
+            assert!(msg.contains("  second"), "{msg}");
+            assert!(msg.contains("no flag lifts"), "{msg}");
+            assert!(!msg.contains("--warn-only"), "{msg}");
+        }
+    }
+
+    /// The probe and the diff walk run this one string, and the message walk
+    /// runs the selection without it.
+    #[test]
+    fn merge_diffs_are_appended_to_the_revision_selection() {
+        assert_eq!(
+            with_merge_diffs(HISTORY_REVISIONS),
+            "--all --diff-merges=remerge"
         );
-        assert!(msg.contains(HISTORY_LOG_OPTS), "{msg}");
-        assert!(msg.contains("2.36"), "{msg}");
+        assert_eq!(with_merge_diffs("a..b"), "a..b --diff-merges=remerge");
     }
 
     /// The guard itself needs a pty to exercise and is deliberately left to

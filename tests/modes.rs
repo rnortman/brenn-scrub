@@ -64,6 +64,18 @@ fn run_in(repo: &Path, args: &[&str], stdin: &str) -> Output {
 }
 
 fn run_in_env(repo: &Path, args: &[&str], stdin: &str, env: &[(&str, &str)]) -> Output {
+    run_in_full(repo, args, stdin, env, None)
+}
+
+/// `run_in_env`, with `path_prefix` searched first for the programs the
+/// binary under test and its gitleaks spawn.
+fn run_in_full(
+    repo: &Path,
+    args: &[&str],
+    stdin: &str,
+    env: &[(&str, &str)],
+    path_prefix: Option<&Path>,
+) -> Output {
     let mut cmd = Command::new(scrub_bin());
     cmd.current_dir(repo)
         // The overlay is a local convention; these assertions are about the
@@ -77,7 +89,7 @@ fn run_in_env(repo: &Path, args: &[&str], stdin: &str, env: &[(&str, &str)]) -> 
     // environment would point the spawned binary — and the `gitleaks` it
     // spawns — at some other repo entirely.
     brenn_git_fixture::hermetic(&mut cmd);
-    common::prepend_path(&mut cmd, None);
+    common::prepend_path(&mut cmd, path_prefix);
     // The case's own variables are a deliberate injection and must survive
     // the `GIT_*` strip above, which would otherwise erase `GIT_TRACE`.
     cmd.envs(env.iter().copied());
@@ -240,24 +252,8 @@ fn history_scans_what_only_a_merge_resolution_introduces() {
     if !gitleaks_available() {
         return;
     }
-    let dir = repo_with(&[("src/a.rs", "let user = \"alice\";\n")]);
+    let (dir, _, merge) = repo_with_conflicted_merge(&canary(), "merge");
     let p = dir.path();
-    git(p, &["checkout", "-qb", "side"]);
-    write_file(p, "src/b.rs", "let side = 1;\n");
-    git(p, &["add", "-A"]);
-    git(p, &["commit", "-qm", "side"]);
-    git(p, &["checkout", "-q", "main"]);
-    write_file(p, "src/b.rs", "let main = 1;\n");
-    git(p, &["add", "-A"]);
-    git(p, &["commit", "-qm", "main"]);
-    assert!(
-        !try_git(p, &["merge", "-q", "side"]),
-        "the fixture needs a conflict"
-    );
-    write_file(p, "src/b.rs", &canary());
-    git(p, &["add", "-A"]);
-    git(p, &["commit", "-qm", "merge"]);
-    let merge = head(p);
     write_file(p, "src/b.rs", "let both = 1;\n");
     git(p, &["commit", "-qam", "remove it"]);
 
@@ -976,4 +972,517 @@ fn history_probe_refuses_a_broken_ref_and_quotes_git() {
         out.stderr
     );
     assert!(!out.stderr.contains("did not complete"), "{}", out.stderr);
+}
+
+/// A key the built-in `aws-access-token` rule catches, for commit messages.
+/// Assembled at runtime so this file never contains a literal the gate would
+/// flag.
+fn message_canary() -> String {
+    format!("{}{}", "AKIA", "Z7QWERTY5UIOXPLK")
+}
+
+/// A clean-diff commit on top of a clean repo whose message is `message`.
+/// Returns the repo, the base sha and the commit's sha.
+fn repo_with_message(message: &str) -> (tempfile::TempDir, String, String) {
+    let dir = repo_with(&[("src/a.rs", "let user = \"alice\";\n")]);
+    let p = dir.path();
+    let base = head(p);
+    write_file(p, "src/b.rs", "let peer = \"bob\";\n");
+    git(p, &["add", "src/b.rs"]);
+    git(p, &["commit", "-qm", message]);
+    let commit = head(p);
+    (dir, base, commit)
+}
+
+fn message_location(sha: &str, line: u32) -> String {
+    format!("commit {sha}, message line {line}")
+}
+
+/// A merge that must conflict: `main` and `side` both add `src/b.rs`, and
+/// the merge resolves it to `resolution`, committed with `merge_message`.
+/// Returns the repo, `main` before the merge, and the merge sha.
+fn repo_with_conflicted_merge(
+    resolution: &str,
+    merge_message: &str,
+) -> (tempfile::TempDir, String, String) {
+    let dir = repo_with(&[("src/a.rs", "let user = \"alice\";\n")]);
+    let p = dir.path();
+    git(p, &["checkout", "-qb", "side"]);
+    write_file(p, "src/b.rs", "let side = 1;\n");
+    git(p, &["add", "-A"]);
+    git(p, &["commit", "-qm", "side"]);
+    git(p, &["checkout", "-q", "main"]);
+    write_file(p, "src/b.rs", "let main = 1;\n");
+    git(p, &["add", "-A"]);
+    git(p, &["commit", "-qm", "main"]);
+    let before = head(p);
+    assert!(
+        !try_git(p, &["merge", "-q", "side"]),
+        "the fixture needs a conflict"
+    );
+    write_file(p, "src/b.rs", resolution);
+    git(p, &["add", "-A"]);
+    git(p, &["commit", "-qm", merge_message]);
+    let merge = head(p);
+    (dir, before, merge)
+}
+
+/// A pushed merge's own resolution is diffed: the string exists only in the
+/// merge and is gone again at the tip, so neither the plain commit walk nor
+/// the tip tree could see it.
+#[test]
+fn range_scans_what_only_a_merge_resolution_introduces() {
+    if !gitleaks_available() {
+        return;
+    }
+    let (dir, before, merge) = repo_with_conflicted_merge(&canary(), "merge");
+    let p = dir.path();
+    write_file(p, "src/b.rs", "let both = 1;\n");
+    git(p, &["commit", "-qam", "remove it"]);
+
+    let out = run_in(p, &["range"], &update_line(p, &before));
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert!(out.stderr.contains("blocked this push"), "{}", out.stderr);
+    assert!(
+        out.stderr.contains(&format!("(commit {merge})")),
+        "the finding must name the merge: {}",
+        out.stderr
+    );
+}
+
+/// A push through an object that does not exist fails `range`'s probe. The
+/// refusal quotes git and names the version floor as the usual cause, and it
+/// comes from the probe, not from the scan's incomplete-walk check -- under
+/// `--warn-only` too.
+#[test]
+fn range_probe_refuses_a_broken_ref_and_quotes_git() {
+    if !gitleaks_available() {
+        return;
+    }
+    let dir = repo_with(&[("src/a.rs", "let user = \"alice\";\n")]);
+    let p = dir.path();
+    let missing = "1".repeat(40);
+    write_file(p, ".git/refs/heads/broken", &format!("{missing}\n"));
+    let stdin = format!(
+        "refs/heads/broken {missing} refs/heads/broken {}\n",
+        "0".repeat(40)
+    );
+    for args in [&["range"][..], &["range", "--warn-only"][..]] {
+        let out = run_in(p, args, &stdin);
+        assert_eq!(out.code, Some(1), "{args:?} stderr: {}", out.stderr);
+        assert!(out.stderr.contains("git log -n0"), "{}", out.stderr);
+        assert!(out.stderr.contains("bad object"), "{}", out.stderr);
+        assert!(out.stderr.contains("2.36"), "{}", out.stderr);
+        assert!(!out.stderr.contains("did not complete"), "{}", out.stderr);
+        assert!(
+            !out.stderr.contains("would fail the scrub gate"),
+            "{}",
+            out.stderr
+        );
+    }
+}
+
+/// A deletion has nothing to scan, so it must not reach the probe: a ref that
+/// would fail any probe reaching every ref is in the repository, and the
+/// push still passes without a word from git.
+#[test]
+fn a_deletion_only_push_needs_no_probe() {
+    if !gitleaks_available() {
+        return;
+    }
+    let dir = repo_with(&[("src/a.rs", "let user = \"alice\";\n")]);
+    let p = dir.path();
+    write_file(
+        p,
+        ".git/refs/heads/broken",
+        &format!("{}\n", "1".repeat(40)),
+    );
+    let stdin = format!("(delete) {} refs/heads/old {}\n", "0".repeat(40), head(p));
+    let out = run_in(p, &["range"], &stdin);
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    assert!(!out.stderr.contains("git log -n0"), "{}", out.stderr);
+}
+
+/// A commit message is pushed with the commit: a key in it blocks the push
+/// with the reword remedy, not the fix-forward ladder, and `--warn-only`
+/// reports it and lets the push through.
+#[test]
+fn range_blocks_on_a_message_finding_and_warn_only_reports_it() {
+    if !gitleaks_available() {
+        return;
+    }
+    let (dir, base, commit) = repo_with_message(&format!("note {}", message_canary()));
+    let p = dir.path();
+    let stdin = update_line(p, &base);
+
+    let blocked = run_in(p, &["range"], &stdin);
+    assert_eq!(blocked.code, Some(1), "stderr: {}", blocked.stderr);
+    assert!(
+        blocked.stderr.contains("blocked this push"),
+        "{}",
+        blocked.stderr
+    );
+    assert!(
+        blocked.stderr.contains(&message_location(&commit, 1)),
+        "{}",
+        blocked.stderr
+    );
+    assert!(
+        blocked.stderr.contains("For a finding in a commit message"),
+        "{}",
+        blocked.stderr
+    );
+    assert!(
+        !blocked.stderr.contains("How to resolve"),
+        "a message is not fixed forward: {}",
+        blocked.stderr
+    );
+
+    let warned = run_in(p, &["range", "--warn-only"], &stdin);
+    assert_eq!(warned.code, Some(0), "stderr: {}", warned.stderr);
+    assert!(
+        warned.stderr.contains("would fail the scrub gate")
+            && warned.stderr.contains(&message_location(&commit, 1)),
+        "{}",
+        warned.stderr
+    );
+}
+
+#[test]
+fn history_finds_a_message_finding_and_names_the_commit() {
+    if !gitleaks_available() {
+        return;
+    }
+    let (dir, _, commit) = repo_with_message(&format!("note {}", message_canary()));
+    let out = run_in(dir.path(), &["history"], "");
+    assert_history_findings(&out);
+    assert!(
+        out.stderr.contains(&message_location(&commit, 1)),
+        "{}",
+        out.stderr
+    );
+    assert!(out.stderr.contains("rewrite the history"), "{}", out.stderr);
+}
+
+/// Messages get the tree rule set: the diff-only section-symbol rule fires
+/// on a message, which has no `.md` path to allowlist it, and is dropped.
+#[test]
+fn a_section_symbol_in_a_message_is_not_reported() {
+    if !gitleaks_available() {
+        return;
+    }
+    let (dir, base, _) = repo_with_message(&format!("subject\n\nsee design {}3", '\u{a7}'));
+    let p = dir.path();
+    let range = run_in(p, &["range"], &update_line(p, &base));
+    assert_eq!(range.code, Some(0), "stderr: {}", range.stderr);
+    let history = run_in(p, &["history"], "");
+    assert_eq!(history.code, Some(0), "stderr: {}", history.stderr);
+}
+
+#[test]
+fn gitleaks_allow_in_a_message_line_is_honoured() {
+    if !gitleaks_available() {
+        return;
+    }
+    let marked = format!(
+        "subject\n\nkey {} {}",
+        message_canary(),
+        concat!("gitleaks", ":allow")
+    );
+    let (dir, base, _) = repo_with_message(&marked);
+    let p = dir.path();
+    let range = run_in(p, &["range"], &update_line(p, &base));
+    assert_eq!(range.code, Some(0), "stderr: {}", range.stderr);
+    let history = run_in(p, &["history"], "");
+    assert_eq!(history.code, Some(0), "stderr: {}", history.stderr);
+}
+
+/// An empty message lists as a record with an empty body.
+#[test]
+fn an_empty_message_is_scanned_clean() {
+    if !gitleaks_available() {
+        return;
+    }
+    let dir = repo_with(&[("src/a.rs", "let user = \"alice\";\n")]);
+    let p = dir.path();
+    let base = head(p);
+    write_file(p, "src/b.rs", "let peer = \"bob\";\n");
+    git(p, &["add", "src/b.rs"]);
+    git(p, &["commit", "-q", "--allow-empty-message", "-m", ""]);
+    let range = run_in(p, &["range"], &update_line(p, &base));
+    assert_eq!(range.code, Some(0), "stderr: {}", range.stderr);
+    let history = run_in(p, &["history"], "");
+    assert_eq!(history.code, Some(0), "stderr: {}", history.stderr);
+}
+
+/// A conflicted merge is where merge diffs would break the message listing's
+/// framing; its own message must still be read intact.
+#[test]
+fn message_walk_framing_survives_a_conflicted_merge() {
+    if !gitleaks_available() {
+        return;
+    }
+    let message = format!("merge side\n\nkey {}", message_canary());
+    let (dir, before, merge) = repo_with_conflicted_merge("let both = 1;\n", &message);
+    let p = dir.path();
+
+    let history = run_in(p, &["history"], "");
+    assert_history_findings(&history);
+    assert!(
+        history.stderr.contains(&message_location(&merge, 3)),
+        "{}",
+        history.stderr
+    );
+
+    let range = run_in(p, &["range"], &update_line(p, &before));
+    assert_eq!(range.code, Some(1), "stderr: {}", range.stderr);
+    assert!(
+        range.stderr.contains(&message_location(&merge, 3)),
+        "{}",
+        range.stderr
+    );
+}
+
+/// Two branches pushed at one tip list the same commits; the message is
+/// scanned, and reported, once.
+#[test]
+fn a_message_only_canary_shared_by_two_refs_is_reported_once() {
+    if !gitleaks_available() {
+        return;
+    }
+    let (dir, base, commit) = repo_with_message(&format!("note {}", message_canary()));
+    let p = dir.path();
+    let stdin = format!(
+        "refs/heads/main {commit} refs/heads/main {base}\n\
+         refs/heads/release {commit} refs/heads/release {base}\n"
+    );
+    let out = run_in(p, &["range"], &stdin);
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert_eq!(
+        out.stderr.matches(&message_location(&commit, 1)).count(),
+        1,
+        "{}",
+        out.stderr
+    );
+}
+
+/// Site-local rules reach messages: a line only the overlay matches,
+/// written in a message and nowhere else, blocks the push.
+#[test]
+fn an_overlay_rule_canary_in_a_message_is_caught() {
+    if !gitleaks_available() {
+        return;
+    }
+    let message = format!("subject\n\nSubproject commit {SUBMODULE_PIN}");
+    let (dir, base, commit) = repo_with_message(&message);
+    let p = dir.path();
+    let stdin = update_line(p, &base);
+    let public_only = run_in(p, &["range"], &stdin);
+    assert_eq!(
+        public_only.code,
+        Some(0),
+        "the public rules alone must pass: {}",
+        public_only.stderr
+    );
+
+    let overlay = overlay_matching_the_pin(p);
+    let out = run_in_env(
+        p,
+        &["range"],
+        &stdin,
+        &[("BRENN_SCRUB_DENYLIST", overlay.to_str().expect("utf-8"))],
+    );
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert!(
+        out.stderr.contains("[fixture-submodule-pin]")
+            && out.stderr.contains(&message_location(&commit, 3)),
+        "{}",
+        out.stderr
+    );
+}
+
+/// The wrapper's message flag is not part of `tree`'s captured JSON.
+#[test]
+fn tree_stdout_is_unchanged_by_the_finding_field() {
+    if !gitleaks_available() {
+        return;
+    }
+    let dir = repo_with(&[("src/a.rs", &canary())]);
+    let out = run_in(dir.path(), &["tree"], "");
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    let json = tree_json(&out);
+    let finding = json["findings"][0].as_object().expect("one finding");
+    assert!(!finding.contains_key("in_message"), "{:?}", out.stdout);
+}
+
+/// A subject that starts with a binary format's magic number (`MZ`, the PE
+/// header) would make gitleaks skip a message mirrored from its first byte;
+/// the body's key is still found, on the message's own line 3.
+#[test]
+fn a_message_whose_subject_starts_with_binary_magic_is_scanned() {
+    if !gitleaks_available() {
+        return;
+    }
+    let message = format!("MZ-1234: fix login\n\nkey {}", message_canary());
+    let (dir, base, commit) = repo_with_message(&message);
+    let p = dir.path();
+
+    let range = run_in(p, &["range"], &update_line(p, &base));
+    assert_eq!(range.code, Some(1), "stderr: {}", range.stderr);
+    assert!(
+        range.stderr.contains(&message_location(&commit, 3)),
+        "{}",
+        range.stderr
+    );
+
+    let history = run_in(p, &["history"], "");
+    assert_history_findings(&history);
+    assert!(
+        history.stderr.contains(&message_location(&commit, 3)),
+        "{}",
+        history.stderr
+    );
+}
+
+/// `main` stays at a clean commit and `feature` is one commit with
+/// `message`, branched from `main` or, when `orphan`, sharing no history
+/// with it. Returns the repo and the feature commit's sha.
+fn repo_with_feature_message(message: &str, orphan: bool) -> (tempfile::TempDir, String) {
+    let dir = repo_with(&[("src/a.rs", "let user = \"alice\";\n")]);
+    let p = dir.path();
+    if orphan {
+        git(p, &["checkout", "-q", "--orphan", "feature"]);
+    } else {
+        git(p, &["checkout", "-qb", "feature"]);
+    }
+    write_file(p, "src/b.rs", "let peer = \"bob\";\n");
+    git(p, &["add", "-A"]);
+    git(p, &["commit", "-qm", message]);
+    let commit = head(p);
+    (dir, commit)
+}
+
+fn feature_line(commit: &str, remote_sha: &str) -> String {
+    format!("refs/heads/feature {commit} refs/heads/feature {remote_sha}\n")
+}
+
+/// A new branch, and an update whose remote sha this clone lacks, are both
+/// bounded by the merge-base with the default branch; the message walk
+/// reaches the new commit either way.
+#[test]
+fn range_scans_the_messages_of_a_new_branch() {
+    if !gitleaks_available() {
+        return;
+    }
+    let (dir, commit) = repo_with_feature_message(&format!("note {}", message_canary()), false);
+    let p = dir.path();
+    for remote in ["0".repeat(40), "1".repeat(40)] {
+        let out = run_in(p, &["range"], &feature_line(&commit, &remote));
+        assert_eq!(out.code, Some(1), "remote {remote}: {}", out.stderr);
+        assert!(
+            out.stderr.contains(&message_location(&commit, 1)),
+            "remote {remote}: {}",
+            out.stderr
+        );
+    }
+}
+
+/// With no merge-base, the selection falls back to the tip and its whole
+/// ancestry, and the message is still listed and framed.
+#[test]
+fn range_scans_the_messages_of_a_new_branch_with_no_merge_base() {
+    if !gitleaks_available() {
+        return;
+    }
+    let (dir, commit) = repo_with_feature_message(&format!("note {}", message_canary()), true);
+    let p = dir.path();
+    let out = run_in(p, &["range"], &feature_line(&commit, &"0".repeat(40)));
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert!(
+        out.stderr.contains(&message_location(&commit, 1)),
+        "{}",
+        out.stderr
+    );
+}
+
+/// A `git` on PATH that fails the commit-message listing, and only it, so
+/// the probe and gitleaks' diff walk run the real git and succeed.
+fn git_failing_the_message_listing() -> tempfile::TempDir {
+    let real = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|d| d.join("git"))
+        .find(|g| g.is_file())
+        .expect("git on PATH");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("git");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\n\
+             for a in \"$@\"; do\n  \
+               if [ \"$a\" = '--format=%H%x00%B' ]; then\n    \
+                 echo 'fatal: the fixture refuses the message listing' >&2\n    \
+                 exit 128\n  \
+               fi\n\
+             done\n\
+             exec '{}' \"$@\"\n",
+            real.display()
+        ),
+    )
+    .expect("write git shim");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    dir
+}
+
+/// A failed message listing refuses both modes with git's words: `range`
+/// under `--warn-only`, where findings alone would exit 0, and `history`,
+/// where nothing else is found.
+#[test]
+fn a_failed_message_listing_refuses_past_warn_only_and_in_history() {
+    if !gitleaks_available() {
+        return;
+    }
+    let (dir, base, _) = repo_with_message(&format!("note {}", message_canary()));
+    let p = dir.path();
+    let stdin = update_line(p, &base);
+    let shim = git_failing_the_message_listing();
+
+    let warned = run_in(p, &["range", "--warn-only"], &stdin);
+    assert_eq!(warned.code, Some(0), "stderr: {}", warned.stderr);
+
+    let refused = run_in_full(p, &["range", "--warn-only"], &stdin, &[], Some(shim.path()));
+    assert_eq!(refused.code, Some(1), "stderr: {}", refused.stderr);
+    assert!(
+        refused.stderr.contains("did not complete")
+            && refused
+                .stderr
+                .contains("the fixture refuses the message listing"),
+        "{}",
+        refused.stderr
+    );
+    assert!(
+        !refused.stderr.contains("would fail the scrub gate"),
+        "{}",
+        refused.stderr
+    );
+
+    let clean = repo_with(&[("src/a.rs", "let user = \"alice\";\n")]);
+    let history = run_in_full(clean.path(), &["history"], "", &[], Some(shim.path()));
+    assert_eq!(history.code, Some(1), "stderr: {}", history.stderr);
+    assert!(
+        history.stderr.contains("did not complete")
+            && history
+                .stderr
+                .contains("the fixture refuses the message listing"),
+        "{}",
+        history.stderr
+    );
+    assert!(
+        !history.stderr.contains("history: clean"),
+        "{}",
+        history.stderr
+    );
 }

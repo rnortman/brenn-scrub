@@ -36,6 +36,17 @@ fn history_remedy() -> String {
     .join("\n")
 }
 
+fn message_remedy() -> String {
+    [
+        "For a finding in a commit message:",
+        "  The string is in the commit itself; editing the tree does not change it.",
+        "  Reword the message (amend, or rebase and reword) before pushing, or put",
+        "  `gitleaks:allow` on that line of the message, or add a contextual allowlist",
+        "  rule. The marker must be in the message as pushed.",
+    ]
+    .join("\n")
+}
+
 fn ephemeral_note() -> String {
     [
         "Section-symbol references to design and ADR docs rot: those docs are ephemeral",
@@ -78,10 +89,22 @@ pub mod neutral {
     }
 }
 
-/// Format findings for a blocked write or a failed gate.
+/// Format findings for a blocked write or a failed gate. The fix-forward
+/// ladder is for findings in content; a finding in a commit message gets the
+/// reword remedy instead, after the ladder when both kinds are present.
 pub fn rejection(findings: &[Finding], heading: &str) -> String {
     let mut out = listing(findings, heading);
-    out.push_str(&ladder());
+    let in_content = findings.iter().any(|f| !f.in_message);
+    let in_message = findings.iter().any(|f| f.in_message);
+    if in_content {
+        out.push_str(&ladder());
+    }
+    if in_message {
+        if in_content {
+            out.push_str("\n\n");
+        }
+        out.push_str(&message_remedy());
+    }
 
     if findings.iter().any(|f| f.rule_id == EPHEMERAL_RULE) {
         out.push_str("\n\n");
@@ -131,7 +154,86 @@ mod tests {
             file: "src/a.rs".into(),
             matched: "matched-text".into(),
             commit: String::new(),
+            in_message: false,
         }
+    }
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn message_finding(rule: &str) -> Finding {
+        Finding {
+            file: String::new(),
+            commit: SHA.into(),
+            in_message: true,
+            ..finding(rule)
+        }
+    }
+
+    #[test]
+    fn a_message_only_rejection_gets_the_reword_remedy_not_the_ladder() {
+        let msg = rejection(&[message_finding("local-rule-a")], "Blocked.");
+        assert!(
+            msg.contains(&format!("commit {SHA}, message line 12")),
+            "{msg}"
+        );
+        assert!(msg.contains("For a finding in a commit message"), "{msg}");
+        assert!(msg.contains("Reword the message"), "{msg}");
+        assert!(!msg.contains("How to resolve"), "{msg}");
+    }
+
+    #[test]
+    fn a_content_only_rejection_gets_the_ladder_not_the_reword_remedy() {
+        let msg = rejection(&[finding("local-rule-a")], "Blocked.");
+        assert!(msg.contains("How to resolve"), "{msg}");
+        assert!(!msg.contains("For a finding in a commit message"), "{msg}");
+    }
+
+    /// `hook` and `staged` never produce a message finding; their text must
+    /// be exactly the listing and the ladder.
+    #[test]
+    fn a_content_only_rejection_is_the_listing_and_the_ladder() {
+        let findings = [finding("local-rule-a")];
+        assert_eq!(
+            rejection(&findings, "Blocked."),
+            format!("{}{}", listing(&findings, "Blocked."), ladder())
+        );
+    }
+
+    #[test]
+    fn a_mixed_rejection_gives_the_ladder_then_the_reword_remedy() {
+        let msg = rejection(
+            &[finding("local-rule-a"), message_finding("local-rule-b")],
+            "Blocked.",
+        );
+        let ladder_at = msg.find("How to resolve").expect("ladder missing");
+        let remedy_at = msg
+            .find("For a finding in a commit message")
+            .expect("remedy missing");
+        assert!(ladder_at < remedy_at, "{msg}");
+        assert!(
+            msg.contains("\n\nFor a finding in a commit message"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_message_rejection_still_gets_the_ephemeral_note() {
+        let msg = rejection(
+            &[message_finding("local-rule-a"), finding(EPHEMERAL_RULE)],
+            "Blocked.",
+        );
+        assert!(msg.contains("For a finding in a commit message"), "{msg}");
+        assert!(msg.contains("ADR docs rot"), "{msg}");
+    }
+
+    #[test]
+    fn history_rejection_names_a_message_finding_by_commit_and_line() {
+        let msg = history_rejection(&[message_finding("local-rule-a")]);
+        assert!(
+            msg.contains(&format!("commit {SHA}, message line")),
+            "{msg}"
+        );
+        assert!(msg.contains("rewrite the history"), "{msg}");
     }
 
     #[test]
@@ -214,6 +316,22 @@ mod tests {
         assert_neutral(&ladder(), "ladder");
         assert_neutral(&ephemeral_note(), "ephemeral note");
         assert_neutral(&history_remedy(), "history remedy");
+        assert_neutral(&message_remedy(), "message remedy");
+        assert_neutral(
+            &rejection(&[message_finding("local-rule-a")], "Blocked."),
+            "message rejection",
+        );
+        assert_neutral(
+            &rejection(
+                &[finding("local-rule-a"), message_finding("local-rule-b")],
+                "Blocked.",
+            ),
+            "mixed content and message rejection",
+        );
+        assert_neutral(
+            &history_rejection(&[message_finding("local-rule-a")]),
+            "history rejection of a message finding",
+        );
         assert_neutral(
             &history_rejection(&[finding("local-rule-a")]),
             "history rejection",

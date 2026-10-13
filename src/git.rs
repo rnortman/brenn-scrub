@@ -46,17 +46,97 @@ pub fn config_get(repo: &Path, key: &str) -> Option<String> {
 /// failure is any failed `git log -n0`, not only a rejected option: a broken
 /// ref fails it too.
 pub fn probe_log_opts(repo: &Path, opts: &str) -> Result<(), String> {
+    let mut args = vec!["log", "-n0"];
+    args.extend(opts.split_whitespace());
+    git_output(repo, &args).map(drop)
+}
+
+/// Run `git <args>` in `repo`, returning stdout as raw bytes. A nonzero exit
+/// is `Err` carrying git's stderr (lossy, trimmed) rather than a panic, for
+/// callers that report a git failure as a refusal.
+fn git_output(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let out = Command::new("git")
         .current_dir(repo)
-        .args(["log", "-n0"])
-        .args(opts.split_whitespace())
+        .args(args)
         .output()
         .expect("failed to execute git");
     if out.status.success() {
-        Ok(())
+        Ok(out.stdout)
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
+}
+
+/// One commit's identity and its full message, as `git log --format=%B`
+/// prints it: subject, blank line, body, trailing newline. Raw bytes -- git
+/// does not promise an encoding, and the scanner takes bytes.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CommitMessage {
+    pub sha: String,
+    pub body: Vec<u8>,
+}
+
+/// Every commit `revs` selects, with its message. `revs` is a revision
+/// selection only (`a..b`, `<sha>`, `--all`); it must carry no diff options,
+/// which would interleave patches with the records. `Err` is the reason the
+/// listing cannot be trusted: git's stderr for a failed `git log`, or a
+/// description of output that does not frame as `hash NUL body NUL` records.
+///
+/// Under `--format`, stdout is the format string's expansion plus whatever
+/// per-commit text the user's config turns on. Signature verification
+/// (`log.showSignature`) is the one such text, so `--no-show-signature` is
+/// passed; any other option that writes to stdout here belongs beside it.
+pub fn commit_messages(repo: &Path, revs: &str) -> Result<Vec<CommitMessage>, String> {
+    let mut args = vec![
+        "log",
+        "-z",
+        "--format=%H%x00%B",
+        "--no-patch",
+        "--no-show-signature",
+    ];
+    args.extend(revs.split_whitespace());
+    args.push("--");
+    let raw = git_output(repo, &args).map_err(|stderr| format!("git log failed:\n{stderr}"))?;
+    parse_message_records(&raw)
+}
+
+/// Parse `git log -z --format=%H%x00%B` output: `hash NUL body NUL` per
+/// commit. NUL is the only framing byte and git cannot put one inside a
+/// message, so a wrong shape means the stream is not what was asked for; it
+/// is refused rather than guessed at, since a mis-framed listing may leave a
+/// message unscanned.
+fn parse_message_records(raw: &[u8]) -> Result<Vec<CommitMessage>, String> {
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(framed) = raw.strip_suffix(b"\0") else {
+        return Err(
+            "git log succeeded, but its output does not end with a NUL record terminator".into(),
+        );
+    };
+    let fields: Vec<&[u8]> = framed.split(|&b| b == 0).collect();
+    if !fields.len().is_multiple_of(2) {
+        return Err(format!(
+            "git log succeeded, but its output has {} NUL-separated fields; commit records come in hash/message pairs",
+            fields.len()
+        ));
+    }
+    fields
+        .chunks_exact(2)
+        .map(|pair| {
+            let (hash, body) = (pair[0], pair[1]);
+            if hash.is_empty() || !hash.iter().all(u8::is_ascii_hexdigit) {
+                return Err(format!(
+                    "git log succeeded, but its output has a record whose hash field is not a commit id: {:?}",
+                    String::from_utf8_lossy(hash)
+                ));
+            }
+            Ok(CommitMessage {
+                sha: String::from_utf8_lossy(hash).into_owned(),
+                body: body.to_vec(),
+            })
+        })
+        .collect()
 }
 
 pub fn repo_root(from: &Path) -> PathBuf {
@@ -861,6 +941,167 @@ diff --git a/src/a.rs b/src/a.rs
         assert_eq!(
             probe_log_opts(empty.path(), "--all --diff-merges=remerge"),
             Ok(())
+        );
+    }
+
+    /// `range` probes with an update's own revision selection, not `--all`.
+    #[test]
+    fn probe_log_opts_accepts_a_revision_with_merge_diffs() {
+        let dir = repo_with_commit();
+        let p = dir.path();
+        let sha = fixture_git(p, &["rev-parse", "HEAD"]).trim().to_string();
+        assert_eq!(
+            probe_log_opts(p, &format!("{sha} --diff-merges=remerge")),
+            Ok(())
+        );
+        let err = probe_log_opts(p, &format!("{sha} --diff-merges=bogus")).unwrap_err();
+        assert!(err.contains("--diff-merges"), "{err}");
+    }
+
+    const SHA_A: &str = "0123456789abcdef0123456789abcdef01234567";
+    const SHA_B: &str = "89abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn empty_message_listing_is_zero_records() {
+        assert_eq!(parse_message_records(b""), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn message_records_parse_hash_and_body() {
+        let raw = format!("{SHA_A}\0subject\n\nbody line\n\0{SHA_B}\0second\n\0");
+        assert_eq!(
+            parse_message_records(raw.as_bytes()),
+            Ok(vec![
+                CommitMessage {
+                    sha: SHA_A.into(),
+                    body: b"subject\n\nbody line\n".to_vec()
+                },
+                CommitMessage {
+                    sha: SHA_B.into(),
+                    body: b"second\n".to_vec()
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn an_empty_message_is_an_empty_body() {
+        let raw = format!("{SHA_A}\0\0");
+        assert_eq!(
+            parse_message_records(raw.as_bytes()),
+            Ok(vec![CommitMessage {
+                sha: SHA_A.into(),
+                body: Vec::new()
+            }])
+        );
+    }
+
+    #[test]
+    fn a_non_utf8_body_is_kept_verbatim() {
+        let mut raw = format!("{SHA_A}\0").into_bytes();
+        raw.extend_from_slice(b"caf\xe9\n\0");
+        let records = parse_message_records(&raw).expect("frames");
+        assert_eq!(records[0].body, b"caf\xe9\n");
+    }
+
+    #[test]
+    fn an_odd_field_count_is_refused() {
+        let raw = format!("{SHA_A}\0body\0{SHA_B}\0");
+        let err = parse_message_records(raw.as_bytes()).unwrap_err();
+        assert!(err.contains("3 NUL-separated fields"), "{err}");
+    }
+
+    #[test]
+    fn a_non_hex_hash_field_is_refused() {
+        let err = parse_message_records(b"diff --git a/x b/x\0body\0").unwrap_err();
+        assert!(err.contains("not a commit id"), "{err}");
+        let err = parse_message_records(b"\0body\0").unwrap_err();
+        assert!(err.contains("not a commit id"), "{err}");
+    }
+
+    #[test]
+    fn a_listing_without_a_terminating_nul_is_refused() {
+        let raw = format!("{SHA_A}\0body");
+        let err = parse_message_records(raw.as_bytes()).unwrap_err();
+        assert!(err.contains("terminator"), "{err}");
+    }
+
+    #[test]
+    fn commit_messages_lists_a_commit_with_its_full_message() {
+        let dir = repo_with_commit();
+        let p = dir.path();
+        std::fs::write(p.join("g.rs"), "x\n").unwrap();
+        fixture_git(p, &["add", "g.rs"]);
+        fixture_git(p, &["commit", "-qm", "subject", "-m", "body text"]);
+        let head = fixture_git(p, &["rev-parse", "HEAD"]).trim().to_string();
+        let base = fixture_git(p, &["rev-parse", "HEAD~1"]).trim().to_string();
+
+        assert_eq!(
+            commit_messages(p, &head),
+            Ok(vec![
+                CommitMessage {
+                    sha: head.clone(),
+                    body: b"subject\n\nbody text\n".to_vec()
+                },
+                CommitMessage {
+                    sha: base.clone(),
+                    body: b"base\n".to_vec()
+                },
+            ])
+        );
+        let ranged = commit_messages(p, &format!("{base}..{head}")).expect("lists");
+        assert_eq!(ranged.len(), 1);
+        assert_eq!(ranged[0].sha, head);
+    }
+
+    #[test]
+    fn commit_messages_of_an_empty_range_is_empty() {
+        let dir = repo_with_commit();
+        let p = dir.path();
+        let head = fixture_git(p, &["rev-parse", "HEAD"]).trim().to_string();
+        assert_eq!(
+            commit_messages(p, &format!("{head}..{head}")),
+            Ok(Vec::new())
+        );
+    }
+
+    #[test]
+    fn commit_messages_of_a_bad_range_carries_git_s_words() {
+        let dir = repo_with_commit();
+        let err = commit_messages(dir.path(), "deadbeef..HEAD").unwrap_err();
+        assert!(err.starts_with("git log failed:\n"), "{err}");
+        assert!(err.contains("fatal:"), "{err}");
+    }
+
+    /// `log.showSignature` writes each signed commit's verification result
+    /// to stdout ahead of its record; the listing must frame regardless.
+    #[test]
+    fn commit_messages_frames_a_signed_commit_under_show_signature() {
+        let keys = tempfile::tempdir().unwrap();
+        let key = keys.path().join("key");
+        let keygen = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(&key)
+            .output();
+        if !keygen.is_ok_and(|out| out.status.success()) {
+            eprintln!("skipping: ssh-keygen is unavailable to sign a fixture commit");
+            return;
+        }
+        let dir = repo_with_commit();
+        let p = dir.path();
+        let key = key.to_str().expect("utf-8 key path");
+        fixture_git(p, &["config", "gpg.format", "ssh"]);
+        fixture_git(p, &["config", "user.signingkey", key]);
+        fixture_git(p, &["commit", "-q", "--allow-empty", "-S", "-m", "signed"]);
+        fixture_git(p, &["config", "log.showSignature", "true"]);
+        let head = fixture_git(p, &["rev-parse", "HEAD"]).trim().to_string();
+
+        assert_eq!(
+            commit_messages(p, &format!("{head}~1..{head}")),
+            Ok(vec![CommitMessage {
+                sha: head,
+                body: b"signed\n".to_vec()
+            }])
         );
     }
 }

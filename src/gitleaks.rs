@@ -33,12 +33,19 @@ pub struct Finding {
     pub matched: String,
     #[serde(rename = "Commit", default)]
     pub commit: String,
+    /// Set by the wrapper, never by gitleaks: the finding is in a commit's
+    /// message, `commit` names it, and `file` is empty.
+    #[serde(skip)]
+    pub in_message: bool,
 }
 
 impl Finding {
-    /// `file:line` plus the commit when the scan was history-based.
+    /// The commit and message line for a message finding; otherwise
+    /// `file:line`, plus the commit when the scan was history-based.
     pub fn location(&self) -> String {
-        if self.commit.is_empty() {
+        if self.in_message {
+            format!("commit {}, message line {}", self.commit, self.start_line)
+        } else if self.commit.is_empty() {
             format!("{}:{}", self.file, self.start_line)
         } else {
             format!(
@@ -68,6 +75,36 @@ pub fn relativize(findings: Vec<Finding>, root: &Path) -> Vec<Finding> {
             if let Ok(rel) = Path::new(&f.file).strip_prefix(root) {
                 f.file = rel.to_string_lossy().into_owned();
             }
+            f
+        })
+        .collect()
+}
+
+/// What a mirrored message file starts with, ahead of the message. gitleaks
+/// `dir` skips, without a word and whatever the file's name, a file whose
+/// leading bytes sniff as an application format (`MZ`, `%PDF`, `BZh`, ...).
+/// A commit subject can start with any of those; a line break starts none.
+/// A signature at an interior offset gitleaks checks (tar's `ustar`, DICOM's
+/// `DICM`, among others) still sniffs; no fixed lead short of padding every
+/// message past every such offset avoids it.
+const MESSAGE_LEAD: &[u8] = b"\n";
+
+/// The bytes a commit message is mirrored as for `attribute_to_messages`.
+pub fn message_file(body: &[u8]) -> Vec<u8> {
+    [MESSAGE_LEAD, body].concat()
+}
+
+/// Findings of a mirror of `message_file`s, re-attributed: the relativized
+/// `file` is the commit sha the mirror named the message after, and the
+/// line is counted from the message's first line rather than the file's.
+pub fn attribute_to_messages(findings: Vec<Finding>) -> Vec<Finding> {
+    let lead_lines = MESSAGE_LEAD.iter().filter(|&&b| b == b'\n').count() as i64;
+    findings
+        .into_iter()
+        .map(|mut f| {
+            f.commit = std::mem::take(&mut f.file);
+            f.start_line -= lead_lines;
+            f.in_message = true;
             f
         })
         .collect()
@@ -199,6 +236,7 @@ pub struct IncompleteScan {
 /// real-engine tests in tests/modes.rs hold that). A `git log` killed
 /// without writing to stderr is not detected: gitleaks logs git's exit
 /// status only at debug level.
+// TODO(silent-git-kill-in-diff-walk)
 fn complete_git_report(stdout: &str, stderr: &str) -> Result<Vec<Finding>, IncompleteScan> {
     if !stderr.is_empty() {
         return Err(IncompleteScan {
@@ -236,6 +274,7 @@ mod tests {
             file: "/tmp/mirror/src/a.rs".into(),
             matched: "m".into(),
             commit: String::new(),
+            in_message: false,
         }
     }
 
@@ -295,6 +334,7 @@ mod tests {
         assert_eq!(findings[0].rule_id, "ephemeral-reference");
         assert_eq!(findings[0].start_line, 1);
         assert_eq!(findings[0].file, "/m/src/a.rs");
+        assert!(!findings[0].in_message);
     }
 
     const ONE_FINDING: &str = concat!(
@@ -343,6 +383,56 @@ mod tests {
         assert_eq!(f.location(), "/tmp/mirror/src/a.rs:7");
         f.commit = "abc123".into();
         assert!(f.location().contains("commit abc123"));
+    }
+
+    const MESSAGE_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn message_finding(rule: &str) -> Finding {
+        let mut f = finding(rule);
+        f.file = format!("/tmp/mirror/{MESSAGE_SHA}");
+        let rel = relativize(vec![f], Path::new("/tmp/mirror"));
+        attribute_to_messages(rel).remove(0)
+    }
+
+    #[test]
+    fn attribute_to_messages_moves_the_file_into_the_commit() {
+        let f = message_finding("local-rule-a");
+        assert_eq!(f.commit, MESSAGE_SHA);
+        assert!(f.file.is_empty());
+        assert!(f.in_message);
+    }
+
+    /// `finding` reports file line 7; the message's own line is 7 less the
+    /// lines `message_file` puts ahead of the message.
+    #[test]
+    fn a_message_finding_is_counted_from_the_message_s_first_line() {
+        let lead = message_file(b"").iter().filter(|&&b| b == b'\n').count();
+        assert_eq!(message_file(b"MZ-1 subject"), b"\nMZ-1 subject");
+        assert_eq!(message_finding("local-rule-a").start_line, 7 - lead as i64);
+    }
+
+    #[test]
+    fn a_message_finding_is_located_by_commit_and_message_line() {
+        let loc = message_finding("local-rule-a").location();
+        assert_eq!(loc, format!("commit {MESSAGE_SHA}, message line 6"));
+        assert!(!loc.contains(':'), "{loc}");
+    }
+
+    #[test]
+    fn tree_filter_drops_a_diff_only_rule_from_a_message() {
+        let kept = apply_tree_filter(vec![
+            message_finding(EPHEMERAL_RULE),
+            message_finding("local-rule-a"),
+        ]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].rule_id, "local-rule-a");
+        assert!(kept[0].in_message);
+    }
+
+    #[test]
+    fn the_message_flag_never_reaches_serialized_output() {
+        let json = serde_json::to_string(&message_finding("local-rule-a")).unwrap();
+        assert!(!json.contains("in_message"), "{json}");
     }
 
     #[test]

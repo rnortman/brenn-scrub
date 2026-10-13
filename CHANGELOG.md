@@ -15,10 +15,23 @@ Notable changes to brenn-scrub. Format follows
   checks every commit reachable from any branch or tag, with every rule, and
   names the commit each finding came from. Merge commits are checked for
   what they change beyond git's automatic merge (such as a hand-made
-  conflict resolution). Because its findings are already committed, its
-  advice is to accept each one or rewrite the history before publishing,
+  conflict resolution), and every commit's message is checked too, a
+  finding there naming its commit and line. Because its findings are
+  already committed, its advice is to accept each one or rewrite the history before publishing,
   rather than to edit the files. Exits 0 when clean, 1 otherwise.
   Requires git 2.36 or later.
+
+### Changed
+
+- The pre-push check (`range`) now blocks a push on text in a pushed
+  commit's message and on what a pushed merge changes beyond git's automatic
+  merge (such as a hand-made conflict resolution); before, it saw neither.
+  A finding in a message names its commit and line, and the advice is to
+  reword the message (amend, or rebase and reword) before pushing. `range`
+  now requires git 2.36 or later: an older git refuses the push with a
+  message naming that floor. The pre-push hook runs whichever `brenn-scrub`
+  is on `PATH`, so updating the binary is enough to pick this up; the Bazel
+  recipe picks it up when its pinned version is bumped.
 
 ### Fixed
 
@@ -35,8 +48,15 @@ Notable changes to brenn-scrub. Format follows
 
 ### Known limitations
 
-- `history` does not scan commit messages; read them yourself before
-  publishing.
+- A merge with three or more parents (an octopus merge) contributes no
+  diff of its own in `range` or `history`; its message and the other
+  commits are still scanned. A finding in a merge's own resolution names
+  the path with git's `b/` prefix.
+- gitleaks 8.30.0 skips, without a word, a file whose bytes sniff as a
+  binary format. A commit message is scanned whatever its subject starts
+  with, but one whose bytes match a format signature at an interior offset
+  gitleaks checks (tar's `ustar` or DICOM's `DICM`, for example) is still
+  skipped.
 - A `git log` killed without writing to stderr (by the OOM killer, a memory
   cap, or an external timeout) still reads as a clean or partial scan in
   `range` and `history`: gitleaks 8.30.0 reports git's exit status only at

@@ -97,6 +97,14 @@ it exits 0 with an audit line on stderr. The commit and push gates still scan
 everything that lands in a gated repository, so nothing reaches a remote
 unscanned. One hook registration is therefore safe from any session.
 
+The pre-push `range` scans each pushed commit's diff, what each pushed merge
+changes beyond git's automatic merge, each pushed commit's message, and the
+tree at each pushed tip. It needs git 2.36 or later; an older git refuses the
+push with a message naming that floor. A finding in a merge's own resolution
+names the path with git's `b/` prefix, and a merge with three or more parents
+(an octopus merge) contributes no diff of its own, in `range` and `history`
+alike.
+
 ## Running it by hand
 
 Three modes are meant for a human, and none reads stdin:
@@ -111,8 +119,8 @@ Three modes are meant for a human, and none reads stdin:
   produced them: capture it as a worklist.
 - `brenn-scrub history` scans every commit reachable from any ref, with
   every rule, and names each finding's commit; a merge contributes what it
-  changes beyond git's automatic merge (git 2.36 or later). Commit messages
-  are not scanned: read them yourself. A string committed and
+  changes beyond git's automatic merge (git 2.36 or later), and every
+  commit's message is scanned with the tree rule set. A string committed and
   removed later passes `tree` but not `history`: run it before publishing
   a repository whose history was private. (`range` cannot stand in for it:
   a first push of `main` scans back only to the merge-base with the default
